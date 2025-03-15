@@ -1,0 +1,101 @@
+# ASIRA Account Lockdown Playbook
+# Version: 1.0.0
+# Last updated: 2025-03-15 12:34:22
+# Author: Mritunjay-mj
+
+id: pb_account_lockdown
+name: Account Lockdown
+description: Locks down a potentially compromised user account and performs security checks
+execution_mode: sequential
+enabled: true
+version: 1.0.0
+created_at: 1741784062
+updated_at: 1741784062
+author: Mritunjay-mj
+
+actions:
+  - id: disable_account
+    type: command
+    description: Disable the user account temporarily
+    command: user_mgmt disable {incident.username}
+    continue_on_failure: false
+    timeout: 60
+    parameters:
+      force: true
+      log_reason: "Automated lockdown due to security incident {incident.id}"
+
+  - id: reset_password
+    type: command
+    description: Force a password reset for the user account
+    command: user_mgmt reset_pwd {incident.username} --force
+    continue_on_failure: true
+    timeout: 60
+
+  - id: revoke_sessions
+    type: api_call
+    description: Revoke all active sessions for the user
+    api_endpoint: https://auth.example.com/api/sessions/{incident.username}
+    api_method: DELETE
+    api_payload:
+      reason: "Security incident response"
+      incident_id: "{incident.id}"
+    continue_on_failure: true
+    timeout: 60
+
+  - id: enable_mfa
+    type: api_call
+    description: Enforce MFA for the user account
+    api_endpoint: https://auth.example.com/api/users/{incident.username}/mfa
+    api_method: PUT
+    api_payload:
+      enforce_mfa: true
+      grace_period_hours: 0
+    continue_on_failure: true
+    timeout: 30
+
+  - id: gather_login_history
+    type: enrichment
+    description: Collect login history for the user account
+    command: user_mgmt audit {incident.username} --days 30 --format json > {execution.id}_login_history.json
+    continue_on_failure: true
+    timeout: 120
+
+  - id: notify_security_team
+    type: notification
+    description: Notify security team about the account lockdown
+    template: security_incident
+    channels:
+      - email
+      - slack
+    parameters:
+      severity: "{incident.severity}"
+      username: "{incident.username}"
+      incident_id: "{incident.id}"
+      incident_url: "https://asira.example.com/incidents/{incident.id}"
+    continue_on_failure: true
+    timeout: 30
+
+  - id: notify_user
+    type: notification
+    description: Notify affected user about the account action
+    template: account_compromise
+    channels:
+      - email
+      - sms
+    parameters:
+      username: "{incident.username}"
+      reset_url: "https://account.example.com/reset?token={action_results.reset_password.reset_token}"
+      help_contact: "security@example.com"
+    continue_on_failure: true
+    timeout: 30
+
+tags:
+  - account
+  - identity
+  - compromise
+  - authentication
+
+target_severity:
+  - medium
+  - high
+  - critical
