@@ -9,8 +9,8 @@ Functionalities:
 - Extract and transform features for anomaly detection models
 
 Version: 1.0.0
-Last updated: 2025-03-15 12:11:48
-Last updated by: Mritunjay-mj
+Last updated: 2025-03-15 18:04:31
+Last updated by: Rahul
 """
 
 import os
@@ -28,9 +28,24 @@ import hashlib
 import gzip
 import requests
 from pathlib import Path
+import uuid
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue, Empty
+
+# Import ASIRA modules
+from src.common.config import Settings
+from src.common.logging_config import get_logger
 
 # Initialize logger
-logger = logging.getLogger("asira.detection.processor")
+logger = get_logger("asira.detection.processor")
+
+# Import settings
+try:
+    settings = Settings()
+except Exception as e:
+    logger.warning(f"Failed to load settings: {e}. Using defaults.")
+    settings = None
 
 class LogNormalizer:
     """
@@ -859,3 +874,481 @@ class FeatureExtractor:
             
         Returns:
             DataFrame with added behavioral features
+        """
+        # Skip if dataframe is empty or too small
+        if df.empty or len(df) < 2:
+            return df
+            
+        # Ensure timestamp is present and sort by it
+        if "timestamp" not in df.columns:
+            return df
+            
+        # Sort by timestamp
+        df = df.sort_values("timestamp")
+        
+        # Extract source IP based features if available
+        if "source_ip" in df.columns:
+            # Count events per IP
+            ip_counts = df.groupby("source_ip").size().to_dict()
+            df["source_ip_count"] = df["source_ip"].map(ip_counts)
+            
+            # Calculate time since last activity from this IP
+            df["prev_timestamp"] = df.groupby("source_ip")["timestamp"].shift(1)
+            df["time_since_last_ip_activity"] = df["timestamp"] - df["prev_timestamp"]
+            df["time_since_last_ip_activity"] = df["time_since_last_ip_activity"].fillna(0)
+            
+            # Calculate event rate (events per hour) for this IP
+            first_seen = df.groupby("source_ip")["timestamp"].transform("min")
+            last_seen = df.groupby("source_ip")["timestamp"].transform("max")
+            time_span = last_seen - first_seen
+            # Avoid division by zero
+            time_span = np.maximum(time_span, 3600)  # Use at least 1 hour
+            df["source_ip_event_rate"] = df["source_ip_count"] / (time_span / 3600)
+        
+        # Extract username based features if available
+        if "username" in df.columns and df["username"].notna().any():
+            # Count events per username
+            user_counts = df.groupby("username").size().to_dict()
+            df["username_count"] = df["username"].map(user_counts)
+            
+            # Calculate time since last activity from this username
+            df["prev_user_timestamp"] = df.groupby("username")["timestamp"].shift(1)
+            df["time_since_last_user_activity"] = df["timestamp"] - df["prev_user_timestamp"]
+            df["time_since_last_user_activity"] = df["time_since_last_user_activity"].fillna(0)
+            
+            # Detect username switching on same IP (potential credential stuffing)
+            if "source_ip" in df.columns:
+                df["prev_ip_username"] = df.groupby("source_ip")["username"].shift(1)
+                df["username_switched"] = (df["username"] != df["prev_ip_username"]) & (df["prev_ip_username"].notna())
+                df["username_switched"] = df["username_switched"].astype(int)
+        
+        # Extract action/event type based features if available
+        action_field = None
+        for field in ["action", "event_type", "category"]:
+            if field in df.columns:
+                action_field = field
+                break
+                
+        if action_field:
+            # Count actions per source
+            df["action_count"] = df.groupby([action_field]).cumcount()
+            
+            # Calculate time since last instance of this action
+            df["prev_action_timestamp"] = df.groupby(action_field)["timestamp"].shift(1)
+            df["time_since_last_action"] = df["timestamp"] - df["prev_action_timestamp"]
+            df["time_since_last_action"] = df["time_since_last_action"].fillna(0)
+        
+        # Extract status based features if available (success/failure patterns)
+        if "status" in df.columns:
+            # Count consecutive failures
+            is_failure = df["status"].isin(["failure", "failed", "error", "denied"])
+            df["is_failure"] = is_failure.astype(int)
+            
+            # Group by source entities and calculate consecutive failures
+            if "source_ip" in df.columns:
+                df["failure_group"] = ((is_failure != is_failure.shift(1)) | 
+                                      (df["source_ip"] != df["source_ip"].shift(1))).cumsum()
+                consecutive_failures = df[is_failure].groupby(["failure_group", "source_ip"]).cumcount() + 1
+                df["consecutive_failures"] = 0
+                df.loc[is_failure, "consecutive_failures"] = consecutive_failures
+                
+            # Calculate failure ratio
+            if "username" in df.columns:
+                failure_counts = df[is_failure].groupby("username").size()
+                total_counts = df.groupby("username").size()
+                failure_ratios = (failure_counts / total_counts).fillna(0).to_dict()
+                df["user_failure_ratio"] = df["username"].map(failure_ratios)
+        
+        # Add velocity features (rate of events)
+        df["event_timestamp_delta"] = df["timestamp"].diff().fillna(0)
+        
+        # Calculate short-term and long-term event velocities (events per minute)
+        # Short-term: based on last N events
+        window_sizes = [5, 20]
+        for window in window_sizes:
+            col_name = f"velocity_{window}"
+            df[col_name] = (window / df["timestamp"].rolling(window=window+1).apply(
+                lambda x: max(x.iloc[-1] - x.iloc[0], 1), raw=True
+            )).fillna(0)
+        
+        # Clean up intermediate columns
+        cols_to_drop = ["prev_timestamp", "prev_action_timestamp", "prev_ip_username",
+                        "prev_user_timestamp", "failure_group"]
+        for col in cols_to_drop:
+            if col in df.columns:
+                df.drop(col, axis=1, inplace=True)
+                
+        return df
+
+
+class LogProcessor:
+    """
+    Core log processing class that orchestrates the entire workflow:
+    ingestion -> normalization -> feature extraction -> detection
+    """
+    
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initialize the log processor with configuration
+        
+        Args:
+            config: Configuration dictionary for the processor
+        """
+        self.config = config
+        self.ingester = LogIngester(config.get("ingester", {}))
+        self.feature_extractor = FeatureExtractor(config.get("feature_extraction", {}))
+        
+        # Configure processing settings
+        self.batch_size = config.get("batch_size", 1000)
+        self.max_threads = config.get("max_threads", 4)
+        self.last_processed_timestamp = config.get("start_timestamp", 0)
+        
+        # Data storage
+        self.processed_data = pd.DataFrame()
+        self.processed_count = 0
+        self.feature_cache = {}
+        
+        # Create processing queue for async processing
+        self.processing_queue = Queue()
+        self.queue_size_limit = config.get("queue_size_limit", 10000)
+        self.results_queue = Queue()
+        
+        # Setup thread pool for parallel processing
+        self.executor = ThreadPoolExecutor(max_workers=self.max_threads)
+        self.processing_active = False
+        self.process_thread = None
+        
+        logger.info(f"LogProcessor initialized with {self.max_threads} worker threads")
+        
+    def process_file(self, file_path: str, format_type: str = None) -> pd.DataFrame:
+        """
+        Process a log file: ingest, normalize, and extract features
+        
+        Args:
+            file_path: Path to the log file
+            format_type: Format of the log file (optional)
+            
+        Returns:
+            DataFrame with processed logs
+        """
+        # Ingest the file
+        logs_df = self.ingester.ingest_file(file_path, format_type)
+        
+        if logs_df.empty:
+            logger.warning(f"No data ingested from {file_path}")
+            return pd.DataFrame()
+            
+        logger.info(f"Ingested {len(logs_df)} log entries from {file_path}")
+        
+        # Extract features
+        features_df = self.feature_extractor.extract_features(logs_df)
+        
+        # Update processed count and timestamp
+        self.processed_count += len(features_df)
+        
+        # Update last processed timestamp
+        if "timestamp" in features_df.columns and not features_df.empty:
+            self.last_processed_timestamp = max(
+                self.last_processed_timestamp,
+                features_df["timestamp"].max()
+            )
+            
+        # Cache some results for real-time feature extraction
+        self._update_feature_cache(features_df)
+            
+        return features_df
+    
+    def process_files(self, file_paths: List[str]) -> pd.DataFrame:
+        """
+        Process multiple log files in parallel
+        
+        Args:
+            file_paths: List of paths to log files
+            
+        Returns:
+            Combined DataFrame with processed logs
+        """
+        if not file_paths:
+            return pd.DataFrame()
+            
+        logger.info(f"Processing {len(file_paths)} log files")
+        
+        # Process files in parallel
+        all_results = []
+        
+        # Submit processing tasks to thread pool
+        future_to_file = {
+            self.executor.submit(self.process_file, file_path): file_path
+            for file_path in file_paths
+        }
+        
+        # Collect results as they complete
+        for future in as_completed(future_to_file):
+            file_path = future_to_file[future]
+            try:
+                df = future.result()
+                if not df.empty:
+                    all_results.append(df)
+                    logger.info(f"Successfully processed {file_path}")
+            except Exception as e:
+                logger.error(f"Error processing {file_path}: {e}")
+        
+        # Combine results
+        if not all_results:
+            return pd.DataFrame()
+            
+        combined_df = pd.concat(all_results, ignore_index=False)
+        
+        logger.info(f"Completed processing {len(file_paths)} files, total entries: {len(combined_df)}")
+        
+        return combined_df
+    
+    def process_api(self, api_config: Dict[str, Any]) -> pd.DataFrame:
+        """
+        Process logs from an API endpoint
+        
+        Args:
+            api_config: API configuration
+            
+        Returns:
+            DataFrame with processed logs
+        """
+        # Ingest from API
+        logs_df = self.ingester.ingest_api(api_config)
+        
+        if logs_df.empty:
+            logger.warning(f"No data ingested from API: {api_config.get('url')}")
+            return pd.DataFrame()
+            
+        logger.info(f"Ingested {len(logs_df)} log entries from API")
+        
+        # Extract features
+        features_df = self.feature_extractor.extract_features(logs_df)
+        
+        # Update processed count and timestamp
+        self.processed_count += len(features_df)
+        
+        # Update last processed timestamp
+        if "timestamp" in features_df.columns and not features_df.empty:
+            self.last_processed_timestamp = max(
+                self.last_processed_timestamp,
+                features_df["timestamp"].max()
+            )
+            
+        # Cache some results for real-time feature extraction
+        self._update_feature_cache(features_df)
+            
+        return features_df
+    
+    def start_stream_processing(self, stream_callback: Callable, format_type: str) -> None:
+        """
+        Start asynchronous stream processing
+        
+        Args:
+            stream_callback: Function that yields log entries or batches
+            format_type: Format of the stream data
+        """
+        if self.processing_active:
+            logger.warning("Stream processing already active")
+            return
+            
+        self.processing_active = True
+        
+        # Start processing thread
+        self.process_thread = threading.Thread(
+            target=self._stream_processor,
+            args=(stream_callback, format_type),
+            daemon=True
+        )
+        self.process_thread.start()
+        
+        logger.info("Stream processing started")
+    
+    def stop_stream_processing(self) -> None:
+        """
+        Stop asynchronous stream processing
+        """
+        if not self.processing_active:
+            logger.warning("No stream processing active")
+            return
+            
+        self.processing_active = False
+        
+        # Wait for thread to terminate
+        if self.process_thread and self.process_thread.is_alive():
+            self.process_thread.join(timeout=5.0)
+            
+        logger.info("Stream processing stopped")
+    
+    def get_processing_stats(self) -> Dict[str, Any]:
+        """
+        Get processing statistics
+        
+        Returns:
+            Dictionary with processing statistics
+        """
+        return {
+            "processed_count": self.processed_count,
+            "last_timestamp": self.last_processed_timestamp,
+            "last_timestamp_readable": datetime.datetime.fromtimestamp(self.last_processed_timestamp).isoformat() if self.last_processed_timestamp else None,
+            "queue_size": self.processing_queue.qsize(),
+            "results_queue_size": self.results_queue.qsize(),
+            "feature_cache_size": len(self.feature_cache),
+            "processing_active": self.processing_active
+        }
+    
+    def get_results(self, block: bool = False, timeout: float = 1.0) -> Optional[pd.DataFrame]:
+        """
+        Get processed results from the results queue
+        
+        Args:
+            block: Whether to block waiting for results
+            timeout: Timeout in seconds if blocking
+            
+        Returns:
+            DataFrame with processed results or None if no results available
+        """
+        try:
+            result = self.results_queue.get(block=block, timeout=timeout)
+            self.results_queue.task_done()
+            return result
+        except Empty:
+            return None
+    
+    def _stream_processor(self, stream_callback: Callable, format_type: str) -> None:
+        """
+        Internal stream processing worker
+        
+        Args:
+            stream_callback: Function that yields log entries or batches
+            format_type: Format of the stream data
+        """
+        try:
+            for batch_df in self.ingester.ingest_stream(stream_callback, format_type):
+                if not self.processing_active:
+                    break
+                    
+                if batch_df.empty:
+                    continue
+                    
+                # Extract features
+                features_df = self.feature_extractor.extract_features(batch_df)
+                
+                # Update processed count and timestamp
+                self.processed_count += len(features_df)
+                
+                # Update last processed timestamp
+                if "timestamp" in features_df.columns and not features_df.empty:
+                    self.last_processed_timestamp = max(
+                        self.last_processed_timestamp,
+                        features_df["timestamp"].max()
+                    )
+                    
+                # Cache some results for real-time feature extraction
+                self._update_feature_cache(features_df)
+                
+                # Put in results queue
+                self.results_queue.put(features_df)
+                
+                # Avoid memory issues by ensuring queue doesn't grow too large
+                while self.results_queue.qsize() > self.queue_size_limit:
+                    time.sleep(0.1)
+        except Exception as e:
+            logger.error(f"Error in stream processor: {e}")
+            self.processing_active = False
+    
+    def _update_feature_cache(self, features_df: pd.DataFrame) -> None:
+        """
+        Update feature cache with new data
+        
+        Args:
+            features_df: DataFrame with extracted features
+        """
+        # Cache source IP stats
+        if "source_ip" in features_df.columns:
+            for ip in features_df["source_ip"].unique():
+                if ip is not None and ip != "":
+                    ip_df = features_df[features_df["source_ip"] == ip]
+                    
+                    # Store or update stats
+                    if ip not in self.feature_cache:
+                        self.feature_cache[ip] = {
+                            "first_seen": ip_df["timestamp"].min(),
+                            "last_seen": ip_df["timestamp"].max(),
+                            "count": len(ip_df),
+                            "event_types": {}
+                        }
+                    else:
+                        self.feature_cache[ip]["last_seen"] = max(
+                            self.feature_cache[ip]["last_seen"],
+                            ip_df["timestamp"].max()
+                        )
+                        self.feature_cache[ip]["count"] += len(ip_df)
+                    
+                    # Track event types
+                    for event_field in ["event_type", "action"]:
+                        if event_field in ip_df.columns:
+                            for event_type, count in ip_df[event_field].value_counts().items():
+                                if event_type not in self.feature_cache[ip]["event_types"]:
+                                    self.feature_cache[ip]["event_types"][event_type] = 0
+                                self.feature_cache[ip]["event_types"][event_type] += count
+        
+        # Limit cache size to avoid memory issues
+        max_cache_size = self.config.get("max_cache_size", 10000)
+        if len(self.feature_cache) > max_cache_size:
+            # Remove oldest entries
+            sorted_cache = sorted(
+                self.feature_cache.items(),
+                key=lambda x: x[1]["last_seen"]
+            )
+            to_remove = len(self.feature_cache) - max_cache_size
+            for i in range(to_remove):
+                key = sorted_cache[i][0]
+                del self.feature_cache[key]
+
+
+def create_processor(config_path: str = None) -> LogProcessor:
+    """
+    Create a LogProcessor with configuration from a file or default settings
+    
+    Args:
+        config_path: Path to configuration file (JSON or YAML)
+        
+    Returns:
+        Configured LogProcessor instance
+    """
+    config = {}
+    
+    # Load configuration from file if provided
+    if config_path:
+        try:
+            file_ext = os.path.splitext(config_path)[1].lower()
+            
+            if file_ext == ".json":
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+            elif file_ext in [".yml", ".yaml"]:
+                try:
+                    import yaml
+                    with open(config_path, 'r') as f:
+                        config = yaml.safe_load(f)
+                except ImportError:
+                    logger.error("YAML support requires PyYAML package")
+            else:
+                logger.error(f"Unsupported config file format: {file_ext}")
+                
+        except Exception as e:
+            logger.error(f"Error loading config from {config_path}: {e}")
+    
+    # Use default config from settings if available
+    if not config and settings:
+        config = settings.log_processor_config
+    
+    # Create processor with config
+    return LogProcessor(config)
+
+
+# Module version information
+__version__ = "1.0.0"
+__last_updated__ = "2025-03-15 18:06:59"
+__author__ = "Rahul"
