@@ -27,7 +27,7 @@
 
 The ASIRA API provides programmatic access to the Automated Security Incident Response Agent platform. It allows you to manage security incidents, view detection results, execute response playbooks, and administer the system.
 
-**Base URL**: `http://your-asira-server/api`
+**Base URL**: `http://ironfac.me/api` 
 
 **API Version**: v1
 
