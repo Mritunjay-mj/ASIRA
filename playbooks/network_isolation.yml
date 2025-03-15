@@ -1,0 +1,156 @@
+# ASIRA Network Isolation Playbook
+# Version: 1.0.0
+# Last updated: 2025-03-15 12:34:22
+# Author: Mritunjay-mj
+
+id: pb_network_isolation
+name: Network Segment Isolation
+description: Isolate a compromised network segment to prevent lateral movement
+execution_mode: sequential
+enabled: true
+version: 1.0.0
+created_at: 1741784062
+updated_at: 1741784062
+author: Mritunjay-mj
+
+actions:
+  - id: identify_segment
+    type: enrichment
+    description: Identify the network segment to isolate
+    script: |
+      #!/bin/python3
+      import json
+      # Parse the incident data to determine network segment
+      with open("{incident.network_data}", "r") as f:
+          data = json.load(f)
+      
+      # Identify affected subnet based on IP addresses
+      subnet = determine_subnet(data["source_ips"])
+      
+      # Write to output file for next steps
+      with open("{execution.id}_segment.json", "w") as f:
+          json.dump({"subnet": subnet, "vlan": data.get("vlan")}, f)
+          
+      print(f"Identified network segment: {subnet}")
+    continue_on_failure: false
+    timeout: 120
+
+  - id: block_external_traffic
+    type: command
+    description: Block all external traffic from the compromised segment
+    command: net_control --segment {action_results.identify_segment.subnet} --block-external --direction both
+    continue_on_failure: false
+    timeout: 180
+    parameters:
+      allow_dns: false
+      allow_updates: false
+      log_connections: true
+
+  - id: restrict_internal_traffic
+    type: command
+    description: Restrict internal traffic to essential services only
+    command: net_control --segment {action_results.identify_segment.subnet} --restrict-internal --allow-list critical_services.txt
+    continue_on_failure: true
+    timeout: 180
+    parameters:
+      allow_security_tools: true
+      allow_authentication: true
+      allow_dhcp: true
+      allow_dns: true
+
+  - id: enable_enhanced_monitoring
+    type: command
+    description: Enable enhanced network monitoring for the isolated segment
+    command: net_monitor --segment {action_results.identify_segment.subnet} --level full --pcap true
+    continue_on_failure: true
+    timeout: 120
+    parameters:
+      retention_hours: 168
+      alert_threshold: low
+      capture_headers_only: false
+
+  - id: update_firewall_rules
+    type: api_call
+    description: Update firewall rules to enforce isolation
+    api_endpoint: https://firewall.example.com/api/rules/batch
+    api_method: POST
+    api_payload:
+      operation: "add"
+      priority: "high"
+      rules:
+        - name: "ASIRA-ISOLATE-{action_results.identify_segment.subnet}"
+          source: "{action_results.identify_segment.subnet}"
+          destination: "any"
+          service: "any"
+          action: "deny"
+          log: true
+          description: "Automated isolation due to security incident {incident.id}"
+    continue_on_failure: false
+    timeout: 180
+
+  - id: scan_segment_hosts
+    type: command
+    description: Run security scans on all hosts in the isolated segment
+    command: net_control --segment {action_results.identify_segment.subnet} --scan-hosts --vulnerability-scan --malware-scan
+    continue_on_failure: true
+    timeout: 1800  # 30 minutes
+    parameters:
+      parallel: true
+      max_concurrent: 10
+      priority: high
+
+  - id: create_access_exceptions
+    type: command
+    description: Create temporary access exceptions for essential personnel
+    script: |
+      #!/bin/bash
+      # Read list of essential personnel from incident data
+      cat {incident.essential_personnel} | while read user; do
+        net_control --exception --user $user --segment {action_results.identify_segment.subnet} --duration 24h
+      done
+    continue_on_failure: true
+    timeout: 120
+
+  - id: notify_network_team
+    type: notification
+    description: Notify network team about the segment isolation
+    template: network_isolation
+    channels:
+      - email
+      - slack
+      - pagerduty
+    parameters:
+      segment: "{action_results.identify_segment.subnet}"
+      vlan: "{action_results.identify_segment.vlan}"
+      incident_id: "{incident.id}"
+      duration: "Indefinite - manual restoration required"
+      approver: "{incident.created_by}"
+      scan_results: "{action_results.scan_segment_hosts.results_url}"
+    continue_on_failure: true
+    timeout: 60
+
+  - id: notify_affected_users
+    type: notification
+    description: Notify users affected by the network isolation
+    template: network_restrictions
+    channels:
+      - email
+      - sms
+    parameters:
+      segment_name: "Network segment {action_results.identify_segment.subnet}"
+      restrictions: "Limited network access due to security incident"
+      estimated_duration: "TBD - security investigation in progress"
+      support_contact: "it-security@example.com"
+    continue_on_failure: true
+    timeout: 180
+
+tags:
+  - network
+  - isolation
+  - lateral-movement
+  - containment
+  - infrastructure
+
+target_severity:
+  - high
+  - critical
