@@ -78,7 +78,7 @@ chmod +x install.sh
 # Run the installation script with root privileges
 sudo ./install.sh
 
-```bash
+```
 
 
 
