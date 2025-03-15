@@ -8,7 +8,8 @@ This module combines multiple detection techniques including:
 3. Deep learning (autoencoder neural networks)
 
 Version: 1.0.0
-Last updated: 2025-03-15 12:08:28
+Last updated: 2025-03-15 17:56:45
+Last updated by: Rahul
 """
 
 import os
@@ -18,7 +19,11 @@ import time
 import logging
 import pickle
 import uuid
-from typing import Dict, List, Tuple, Union, Optional, Any
+import json
+import glob
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Tuple, Union, Optional, Any, Set
 from dataclasses import dataclass, field, asdict
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
@@ -30,7 +35,8 @@ import torch.nn.functional as F
 from src.common.config import Settings
 
 # Initialize logger
-logger = logging.getLogger("asira.detection.engine")
+from src.common.logging_config import get_logger
+logger = get_logger("asira.detection.engine")
 
 # Initialize settings
 settings = Settings()
@@ -178,6 +184,18 @@ class MultiModelDetector:
             "autoencoder": 1.0
         })
         self.trained = False
+        
+        # Additional parameters for model management
+        self.model_id = config.get("model_id", f"model_{uuid.uuid4().hex[:8]}")
+        self.version = config.get("version", "1.0.0")
+        self.created_at = time.time()
+        self.updated_at = self.created_at
+        self.training_stats = {}
+        
+        # Cache for recently detected anomalies to avoid duplicates
+        self.recent_anomalies = set()
+        self.max_cache_size = config.get("max_cache_size", 1000)
+        
         logger.info(f"Initialized MultiModelDetector with threshold {self.threshold}")
     
     def _initialize_models(self):
@@ -247,6 +265,8 @@ class MultiModelDetector:
         
         logger.info(f"Training detection models on {len(normal_data)} normal events")
         
+        training_start = time.time()
+        
         # Prepare data
         X = normal_data.values
         self.scaler.fit(X)
@@ -255,11 +275,16 @@ class MultiModelDetector:
         # Train Isolation Forest
         if "isolation_forest" in self.models:
             logger.info("Training isolation forest model")
+            start_time = time.time()
             self.models["isolation_forest"].fit(X_scaled)
-        
+            self.training_stats["isolation_forest"] = {
+                "training_time": time.time() - start_time,
+            }
+            
         # Train Autoencoder
         if "autoencoder" in self.models:
             logger.info("Training autoencoder model")
+            start_time = time.time()
             autoencoder = self.models["autoencoder"]
             
             # Convert to PyTorch tensor
@@ -279,6 +304,12 @@ class MultiModelDetector:
             # For early stopping
             best_loss = float('inf')
             patience_counter = 0
+            
+            # Track training history
+            history = {
+                "train_loss": [],
+                "val_loss": []
+            }
             
             # Training loop
             for epoch in range(epochs):
@@ -304,6 +335,7 @@ class MultiModelDetector:
                     total_loss += loss.item() * batch_x.size(0)
                 
                 avg_loss = total_loss / X_tensor.size(0)
+                history["train_loss"].append(avg_loss)
                 
                 # Validation if provided
                 if validation_data is not None and len(validation_data) > 0:
@@ -315,6 +347,8 @@ class MultiModelDetector:
                     with torch.no_grad():
                         val_outputs = autoencoder(X_val_tensor)
                         val_loss = criterion(val_outputs, X_val_tensor)
+                    
+                    history["val_loss"].append(val_loss.item())
                     
                     if val_loss < best_loss:
                         best_loss = val_loss
@@ -346,10 +380,20 @@ class MultiModelDetector:
                 # Log every 5 epochs
                 if (epoch + 1) % 5 == 0:
                     logger.info(log_message)
+            
+            # Save training stats
+            self.training_stats["autoencoder"] = {
+                "training_time": time.time() - start_time,
+                "epochs": epoch + 1,
+                "final_loss": avg_loss,
+                "best_loss": best_loss,
+                "history": history
+            }
         
         # For statistical model, calculate baseline statistics
         if "statistical" in self.models:
             logger.info("Training statistical model")
+            start_time = time.time()
             
             # Standard stats
             self.models["statistical"]["mean"] = np.mean(X, axis=0)
@@ -359,8 +403,21 @@ class MultiModelDetector:
             self.models["statistical"]["median"] = np.median(X, axis=0)
             self.models["statistical"]["mad"] = np.median(np.abs(X - self.models["statistical"]["median"]), axis=0) * 1.4826
             
+            self.training_stats["statistical"] = {
+                "training_time": time.time() - start_time,
+            }
+            
+        # Update training metadata
         self.trained = True
-        logger.info("Model training completed")
+        self.updated_at = time.time()
+        
+        # Record overall training stats
+        self.training_stats["total_training_time"] = time.time() - training_start
+        self.training_stats["num_samples"] = len(normal_data)
+        self.training_stats["num_features"] = X.shape[1]
+        self.training_stats["feature_names"] = self.feature_names
+        
+        logger.info(f"Model training completed in {self.training_stats['total_training_time']:.2f} seconds")
     
     def detect(self, event_data: pd.DataFrame) -> List[AnomalyDetectionResult]:
         """
@@ -548,8 +605,8 @@ class MultiModelDetector:
             else:
                 combined_score = sum(model_scores.values()) / len(model_scores)
             
-            # Only report if above threshold
-            if combined_score > self.threshold:
+            # Only report if above threshold and not in recent cache
+            if combined_score > self.threshold and event_id not in self.recent_anomalies:
                 # Determine which model had highest confidence
                 best_model = max(model_scores.items(), key=lambda x: x[1])[0]
                 
@@ -567,9 +624,46 @@ class MultiModelDetector:
                     raw_data=raw_data.get(event_id, {})
                 )
                 results.append(result)
+                
+                # Add to recent anomalies cache
+                self.recent_anomalies.add(event_id)
+                
+                # Manage cache size
+                if len(self.recent_anomalies) > self.max_cache_size:
+                    self.recent_anomalies.pop()
         
         logger.info(f"Detection completed. Found {len(results)} anomalies")
         return results
+    
+    def detect_real_time(self, event: Dict[str, Any]) -> Optional[AnomalyDetectionResult]:
+        """
+        Perform real-time anomaly detection on a single event
+        
+        Args:
+            event: Dictionary containing event data
+            
+        Returns:
+            AnomalyDetectionResult if anomaly detected, None otherwise
+        """
+        if not self.trained:
+            logger.warning("Models not trained, detection may not be accurate")
+        
+        # Convert to DataFrame for consistency with batch processing
+        event_df = pd.DataFrame([event])
+        
+        # Add an index for the event
+        event_id = event.get("id", str(uuid.uuid4()))
+        event_df.index = [event_id]
+        
+        # Check if we've seen this event before
+        if event_id in self.recent_anomalies:
+            return None
+        
+        # Run detection
+        results = self.detect(event_df)
+        
+        # Return first result if any, otherwise None
+        return results[0] if results else None
     
     def _find_related_events(self, event_id: str, event_data: pd.DataFrame) -> List[str]:
         """
@@ -746,4 +840,443 @@ class MultiModelDetector:
         if not self.trained:
             logger.warning("Models not trained, saving may result in untrained models")
             
-        os.makedirs(path, exist_
+        os.makedirs(path, exist_ok=True)
+        
+        # Save configuration and metadata
+        config_path = os.path.join(path, "config.json")
+        with open(config_path, "w") as f:
+            config_data = {
+                "model_id": self.model_id,
+                "version": self.version,
+                "created_at": self.created_at,
+                "updated_at": self.updated_at,
+                "threshold": self.threshold,
+                "feature_names": self.feature_names,
+                "model_weights": self.model_weights,
+                "training_stats": self.training_stats
+            }
+            json.dump(config_data, f, indent=2)
+            
+        # Save standard scaler
+        scaler_path = os.path.join(path, "scaler.pkl")
+        with open(scaler_path, "wb") as f:
+            pickle.dump(self.scaler, f)
+            
+        # Save individual models
+        for model_name, model in self.models.items():
+            if model_name == "statistical":
+                # Statistical model is a dictionary, save as JSON
+                stat_path = os.path.join(path, "statistical.json")
+                with open(stat_path, "w") as f:
+                    # Convert numpy arrays to lists for JSON serialization
+                    stat_data = {
+                        "z_score_threshold": model["z_score_threshold"],
+                        "mad_threshold": model["mad_threshold"],
+                        "mean": model["mean"].tolist() if model["mean"] is not None else None,
+                        "std": model["std"].tolist() if model["std"] is not None else None,
+                        "median": model["median"].tolist() if model["median"] is not None else None,
+                        "mad": model["mad"].tolist() if model["mad"] is not None else None
+                    }
+                    json.dump(stat_data, f, indent=2)
+            elif model_name == "isolation_forest":
+                # Isolation Forest is a sklearn model, save with pickle
+                iso_path = os.path.join(path, "isolation_forest.pkl")
+                with open(iso_path, "wb") as f:
+                    pickle.dump(model, f)
+            elif model_name == "autoencoder":
+                # Autoencoder is a PyTorch model, save state dict
+                ae_path = os.path.join(path, "autoencoder.pt")
+                torch.save(model.state_dict(), ae_path)
+                
+                # Also save architecture info
+                ae_config_path = os.path.join(path, "autoencoder_config.json")
+                with open(ae_config_path, "w") as f:
+                    json.dump({
+                        "input_dim": next(model.encoder.parameters()).size(1),
+                        "encoding_dim": next(model.decoder.parameters()).size(1),
+                        "hidden_layers": self.config.get("hidden_layers")
+                    }, f, indent=2)
+        
+        logger.info(f"Models saved to {path}")
+    
+    def load_models(self, path: str):
+        """
+        Load trained models from disk
+        
+        Args:
+            path: Directory path to load models from
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Load configuration and metadata
+            config_path = os.path.join(path, "config.json")
+            with open(config_path, "r") as f:
+                config_data = json.load(f)
+                
+            self.model_id = config_data["model_id"]
+            self.version = config_data["version"]
+            self.created_at = config_data["created_at"]
+            self.updated_at = config_data["updated_at"]
+            self.threshold = config_data["threshold"]
+            self.feature_names = config_data["feature_names"]
+            self.model_weights = config_data["model_weights"]
+            self.training_stats = config_data["training_stats"]
+            
+            # Load standard scaler
+            scaler_path = os.path.join(path, "scaler.pkl")
+            with open(scaler_path, "rb") as f:
+                self.scaler = pickle.load(f)
+                
+            # Load individual models
+            # Statistical model
+            stat_path = os.path.join(path, "statistical.json")
+            if os.path.exists(stat_path):
+                with open(stat_path, "r") as f:
+                    stat_data = json.load(f)
+                    
+                # Initialize statistical model
+                self.models["statistical"] = {
+                    "z_score_threshold": stat_data["z_score_threshold"],
+                    "mad_threshold": stat_data["mad_threshold"],
+                    "mean": np.array(stat_data["mean"]) if stat_data["mean"] is not None else None,
+                    "std": np.array(stat_data["std"]) if stat_data["std"] is not None else None,
+                    "median": np.array(stat_data["median"]) if stat_data["median"] is not None else None,
+                    "mad": np.array(stat_data["mad"]) if stat_data["mad"] is not None else None
+                }
+                
+            # Isolation Forest
+            iso_path = os.path.join(path, "isolation_forest.pkl")
+            if os.path.exists(iso_path):
+                with open(iso_path, "rb") as f:
+                    self.models["isolation_forest"] = pickle.load(f)
+                    
+            # Autoencoder
+            ae_path = os.path.join(path, "autoencoder.pt")
+            ae_config_path = os.path.join(path, "autoencoder_config.json")
+            if os.path.exists(ae_path) and os.path.exists(ae_config_path):
+                with open(ae_config_path, "r") as f:
+                    ae_config = json.load(f)
+                    
+                # Create autoencoder with same architecture
+                autoencoder = Autoencoder(
+                    input_dim=ae_config["input_dim"],
+                    encoding_dim=ae_config["encoding_dim"],
+                    hidden_layers=ae_config["hidden_layers"]
+                )
+                
+                # Load weights
+                autoencoder.load_state_dict(torch.load(ae_path))
+                
+                # Set to eval mode
+                autoencoder.eval()
+                
+                self.models["autoencoder"] = autoencoder
+                
+            self.trained = True
+            logger.info(f"Models loaded from {path}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error loading models from {path}: {e}")
+            return False
+    
+    def get_model_info(self) -> Dict[str, Any]:
+        """
+        Get information about the trained models
+        
+        Returns:
+            Dictionary with model metadata and statistics
+        """
+        model_info = {
+            "model_id": self.model_id,
+            "version": self.version,
+            "created_at": datetime.fromtimestamp(self.created_at).isoformat(),
+            "updated_at": datetime.fromtimestamp(self.updated_at).isoformat(),
+            "trained": self.trained,
+            "threshold": self.threshold,
+            "feature_count": len(self.feature_names),
+            "feature_names": self.feature_names,
+            "models": list(self.models.keys()),
+            "model_weights": self.model_weights
+        }
+        
+        # Add training stats if available
+        if self.training_stats:
+            model_info["training_stats"] = self.training_stats
+            
+        return model_info
+
+
+class DetectionEngine:
+    """
+    Main detection engine that manages multiple detector models and 
+    coordinates the detection workflow
+    """
+    
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initialize the detection engine
+        
+        Args:
+            config: Engine configuration dictionary
+        """
+        self.config = config
+        self.detector_configs = config.get("detectors", [])
+        self.detectors = {}
+        self.models_dir = config.get("models_dir", "models")
+        self.active_detector = None
+        
+        # Initialize all configured detectors
+        for detector_config in self.detector_configs:
+            detector_id = detector_config.get("id", f"detector_{uuid.uuid4().hex[:8]}")
+            self.detectors[detector_id] = MultiModelDetector(detector_config)
+            
+        # Set active detector (use first one by default)
+        if self.detectors:
+            self.active_detector = list(self.detectors.keys())[0]
+            
+        logger.info(f"Detection engine initialized with {len(self.detectors)} detectors")
+        
+    def train(self, detector_id: str, training_data: pd.DataFrame, validation_data: Optional[pd.DataFrame] = None) -> bool:
+        """
+        Train a specific detector
+        
+        Args:
+            detector_id: ID of detector to train
+            training_data: DataFrame with normal events for training
+            validation_data: Optional validation data
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        if detector_id not in self.detectors:
+            logger.error(f"Unknown detector ID: {detector_id}")
+            return False
+            
+        try:
+            detector = self.detectors[detector_id]
+            detector.train(training_data, validation_data)
+            
+            # Save trained model
+            model_path = os.path.join(self.models_dir, detector_id)
+            detector.save_models(model_path)
+            
+            logger.info(f"Detector {detector_id} trained successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error training detector {detector_id}: {e}")
+            return False
+            
+    def detect(self, events: pd.DataFrame) -> List[AnomalyDetectionResult]:
+        """
+        Detect anomalies using the active detector
+        
+        Args:
+            events: DataFrame containing events to analyze
+            
+        Returns:
+            List of detection results
+        """
+        if not self.active_detector:
+            logger.error("No active detector selected")
+            return []
+            
+        if self.active_detector not in self.detectors:
+            logger.error(f"Unknown active detector: {self.active_detector}")
+            return []
+            
+        try:
+            detector = self.detectors[self.active_detector]
+            return detector.detect(events)
+            
+        except Exception as e:
+            logger.error(f"Error during detection: {e}")
+            return []
+            
+    def detect_real_time(self, event: Dict[str, Any]) -> Optional[AnomalyDetectionResult]:
+        """
+        Perform real-time detection on a single event
+        
+        Args:
+            event: Dictionary containing event data
+            
+        Returns:
+            Detection result if anomalous, None otherwise
+        """
+        if not self.active_detector:
+            logger.error("No active detector selected")
+            return None
+            
+        if self.active_detector not in self.detectors:
+            logger.error(f"Unknown active detector: {self.active_detector}")
+            return None
+            
+        try:
+            detector = self.detectors[self.active_detector]
+            return detector.detect_real_time(event)
+            
+        except Exception as e:
+            logger.error(f"Error during real-time detection: {e}")
+            return None
+    
+    def set_active_detector(self, detector_id: str) -> bool:
+        """
+        Set the active detector
+        
+        Args:
+            detector_id: ID of detector to activate
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        if detector_id not in self.detectors:
+            logger.error(f"Unknown detector ID: {detector_id}")
+            return False
+            
+        self.active_detector = detector_id
+        logger.info(f"Active detector set to {detector_id}")
+        return True
+        
+    def load_detector(self, detector_id: str) -> bool:
+        """
+        Load a previously trained detector from disk
+        
+        Args:
+            detector_id: ID of detector to load
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        model_path = os.path.join(self.models_dir, detector_id)
+        
+        if not os.path.exists(model_path):
+            logger.error(f"Model directory not found: {model_path}")
+            return False
+            
+        # Create new detector if it doesn't exist
+        if detector_id not in self.detectors:
+            self.detectors[detector_id] = MultiModelDetector({"id": detector_id})
+            
+        # Load the models
+        result = self.detectors[detector_id].load_models(model_path)
+        
+        if result:
+            logger.info(f"Detector {detector_id} loaded successfully")
+            
+            # Set as active if no active detector
+            if not self.active_detector:
+                self.active_detector = detector_id
+                logger.info(f"Set {detector_id} as active detector")
+                
+        return result
+        
+    def list_detectors(self) -> Dict[str, Dict[str, Any]]:
+        """
+        List all available detectors with their status
+        
+        Returns:
+            Dictionary mapping detector IDs to their status
+        """
+        result = {}
+        
+        # Add in-memory detectors
+        for detector_id, detector in self.detectors.items():
+            result[detector_id] = {
+                "id": detector_id,
+                "trained": detector.trained,
+                "active": detector_id == self.active_detector,
+                "in_memory": True,
+                "info": detector.get_model_info() if detector.trained else {}
+            }
+            
+        # Look for other saved models on disk
+        if os.path.exists(self.models_dir):
+            for entry in os.scandir(self.models_dir):
+                if entry.is_dir() and entry.name not in result:
+                    # Check if this is a valid model directory
+                    config_path = os.path.join(entry.path, "config.json")
+                    if os.path.exists(config_path):
+                        try:
+                            with open(config_path, "r") as f:
+                                config_data = json.load(f)
+                                
+                            result[entry.name] = {
+                                "id": entry.name,
+                                "trained": True,
+                                "active": False,
+                                "in_memory": False,
+                                "info": {
+                                    "model_id": config_data.get("model_id", "unknown"),
+                                    "version": config_data.get("version", "unknown"),
+                                    "created_at": config_data.get("created_at", "unknown"),
+                                    "updated_at": config_data.get("updated_at", "unknown")
+                                }
+                            }
+                        except Exception:
+                            pass
+                            
+        return result
+        
+    def evaluate_detector(self, detector_id: str, test_data: pd.DataFrame, labels: List[bool]) -> Dict[str, float]:
+        """
+        Evaluate a detector's performance
+        
+        Args:
+            detector_id: ID of detector to evaluate
+            test_data: Test data
+            labels: True/False labels (True for anomalies)
+            
+        Returns:
+            Evaluation metrics
+        """
+        if detector_id not in self.detectors:
+            return {"error": f"Unknown detector ID: {detector_id}"}
+            
+        try:
+            detector = self.detectors[detector_id]
+            return detector.evaluate(test_data, labels)
+            
+        except Exception as e:
+            logger.error(f"Error evaluating detector {detector_id}: {e}")
+            return {"error": str(e)}
+            
+    def delete_detector(self, detector_id: str) -> bool:
+        """
+        Delete a detector and its saved models
+        
+        Args:
+            detector_id: ID of detector to delete
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        # Remove from memory
+        if detector_id in self.detectors:
+            del self.detectors[detector_id]
+            
+        # If this was the active detector, reset active
+        if self.active_detector == detector_id:
+            self.active_detector = next(iter(self.detectors)) if self.detectors else None
+            
+        # Remove from disk
+        model_path = os.path.join(self.models_dir, detector_id)
+        if os.path.exists(model_path):
+            try:
+                import shutil
+                shutil.rmtree(model_path)
+                logger.info(f"Deleted detector {detector_id}")
+                return True
+            except Exception as e:
+                logger.error(f"Error deleting detector {detector_id} from disk: {e}")
+                return False
+        
+        return True
+
+
+# Module version information
+__version__ = "1.0.0"
+__last_updated__ = "2025-03-15 17:59:36"
+__author__ = "Rahul"
