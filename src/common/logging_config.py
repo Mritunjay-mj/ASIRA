@@ -5,15 +5,27 @@ Sets up unified logging with configurable levels,
 formatting, and output destinations including file and console.
 
 Version: 1.0.0
-Last updated: 2025-03-15
+Last updated: 2025-03-15 17:22:45
+Last updated by: Rahul
 """
 import os
 import sys
 import logging
 import logging.handlers
 import json
+import time
+import uuid
+import functools
+import threading
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Callable, Union, TypeVar, cast
+from contextlib import contextmanager
+
+# Import settings if available
+try:
+    from src.common.config import settings
+except ImportError:
+    settings = None
 
 # Custom log record serializer for JSON formatting
 def _json_log_formatter(record: logging.LogRecord) -> Dict[str, Any]:
@@ -46,6 +58,22 @@ def _json_log_formatter(record: logging.LogRecord) -> Dict[str, Any]:
     # Add extra attributes
     if hasattr(record, "data") and record.data:
         data["data"] = record.data
+        
+    # Add request_id if available
+    if hasattr(record, "request_id"):
+        data["request_id"] = record.request_id
+        
+    # Add correlation_id if available
+    if hasattr(record, "correlation_id"):
+        data["correlation_id"] = record.correlation_id
+        
+    # Add duration if available for performance logging
+    if hasattr(record, "duration_ms"):
+        data["duration_ms"] = record.duration_ms
+        
+    # Add component if available
+    if hasattr(record, "component"):
+        data["component"] = record.component
         
     return data
 
@@ -84,7 +112,9 @@ def configure_logging(
     max_size_mb: int = 10,
     backup_count: int = 5,
     console_output: bool = True,
-    app_name: str = "ASIRA"
+    app_name: str = "ASIRA",
+    capture_warnings: bool = True,
+    suppress_loggers: Optional[List[str]] = None
 ) -> None:
     """
     Configure logging for the application
@@ -98,6 +128,8 @@ def configure_logging(
         backup_count: Number of backup files to keep
         console_output: Whether to output logs to console
         app_name: Application name for logging
+        capture_warnings: Whether to capture warnings through logging
+        suppress_loggers: List of logger names to suppress
     """
     # Convert string log level to logging constant
     numeric_level = getattr(logging, log_level.upper(), None)
@@ -162,6 +194,16 @@ def configure_logging(
         logger = logging.getLogger(logger_name)
         logger.setLevel(numeric_level)
         logger.propagate = True
+    
+    # Suppress certain loggers if specified
+    if suppress_loggers:
+        for logger_name in suppress_loggers:
+            logger = logging.getLogger(logger_name)
+            logger.setLevel(logging.WARNING)  # Only show warnings and above
+    
+    # Capture Python warnings
+    if capture_warnings:
+        logging.captureWarnings(True)
     
     # Log startup message
     startup_logger = logging.getLogger("asira")
@@ -229,4 +271,253 @@ class ContextLogger:
             New ContextLogger instance with combined context
         """
         new_context = self.context.copy()
-        new_context.update
+        new_context.update(kwargs)
+        return ContextLogger(self.logger, new_context)
+    
+    def debug(self, message: str, **kwargs) -> None:
+        """Log a debug message with context"""
+        context = self.context.copy()
+        context.update(kwargs)
+        log_with_context(self.logger, logging.DEBUG, message, context)
+        
+    def info(self, message: str, **kwargs) -> None:
+        """Log an info message with context"""
+        context = self.context.copy()
+        context.update(kwargs)
+        log_with_context(self.logger, logging.INFO, message, context)
+        
+    def warning(self, message: str, **kwargs) -> None:
+        """Log a warning message with context"""
+        context = self.context.copy()
+        context.update(kwargs)
+        log_with_context(self.logger, logging.WARNING, message, context)
+        
+    def error(self, message: str, exc_info: Any = None, **kwargs) -> None:
+        """Log an error message with context"""
+        context = self.context.copy()
+        context.update(kwargs)
+        log_with_context(self.logger, logging.ERROR, message, context, exc_info=exc_info)
+        
+    def critical(self, message: str, exc_info: Any = None, **kwargs) -> None:
+        """Log a critical message with context"""
+        context = self.context.copy()
+        context.update(kwargs)
+        log_with_context(self.logger, logging.CRITICAL, message, context, exc_info=exc_info)
+        
+    def exception(self, message: str, **kwargs) -> None:
+        """Log an exception message with context and exception info"""
+        context = self.context.copy()
+        context.update(kwargs)
+        log_with_context(self.logger, logging.ERROR, message, context, exc_info=True)
+    
+    @contextmanager
+    def span(self, operation_name: str, **kwargs):
+        """
+        Create a logging span for timing operations
+        
+        Args:
+            operation_name: Name of the operation being performed
+            **kwargs: Additional context for the span
+            
+        Yields:
+            None
+        """
+        start_time = time.time()
+        span_context = self.context.copy()
+        span_context.update(kwargs)
+        span_context["operation"] = operation_name
+        
+        try:
+            yield
+        except Exception as e:
+            duration_ms = (time.time() - start_time) * 1000
+            span_context["duration_ms"] = round(duration_ms, 2)
+            span_context["error"] = str(e)
+            span_context["exception_type"] = e.__class__.__name__
+            self.exception(f"Error in {operation_name}", **span_context)
+            raise
+        else:
+            duration_ms = (time.time() - start_time) * 1000
+            span_context["duration_ms"] = round(duration_ms, 2)
+            self.info(f"Completed {operation_name}", **span_context)
+
+
+# Type variable for function return type
+T = TypeVar('T')
+
+def log_execution_time(logger: Union[logging.Logger, str], level: int = logging.INFO):
+    """
+    Decorator to log execution time of a function
+    
+    Args:
+        logger: Logger instance or logger name
+        level: Log level for the message
+        
+    Returns:
+        Decorator function
+    """
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs) -> T:
+            # Get logger if string was provided
+            actual_logger = logger if isinstance(logger, logging.Logger) else logging.getLogger(logger)
+            
+            start_time = time.time()
+            try:
+                return func(*args, **kwargs)
+            finally:
+                execution_time = time.time() - start_time
+                actual_logger.log(
+                    level, 
+                    f"Function '{func.__name__}' executed in {execution_time:.4f} seconds",
+                    extra={"duration_ms": execution_time * 1000}
+                )
+        return wrapper
+    return decorator
+
+
+class RequestIdFilter(logging.Filter):
+    """Filter that adds request ID to log records"""
+    
+    _request_id_storage = threading.local()
+    
+    @classmethod
+    def get_request_id(cls) -> str:
+        """Get current request ID or generate a new one"""
+        if not hasattr(cls._request_id_storage, "request_id"):
+            cls._request_id_storage.request_id = str(uuid.uuid4())
+        return cls._request_id_storage.request_id
+    
+    @classmethod
+    def set_request_id(cls, request_id: str) -> None:
+        """Set request ID for current thread"""
+        cls._request_id_storage.request_id = request_id
+    
+    @classmethod
+    def clear_request_id(cls) -> None:
+        """Clear request ID for current thread"""
+        if hasattr(cls._request_id_storage, "request_id"):
+            delattr(cls._request_id_storage, "request_id")
+    
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Add request_id to record"""
+        record.request_id = self.get_request_id()
+        return True
+
+
+@contextmanager
+def request_context(request_id: Optional[str] = None):
+    """
+    Context manager for request logging
+    
+    Args:
+        request_id: Optional request ID, generated if not provided
+        
+    Yields:
+        Request ID
+    """
+    if request_id is None:
+        request_id = str(uuid.uuid4())
+    
+    # Set request ID in thread local storage
+    RequestIdFilter.set_request_id(request_id)
+    
+    try:
+        yield request_id
+    finally:
+        RequestIdFilter.clear_request_id()
+
+
+@contextmanager
+def temporary_log_level(logger_name: str, level: int):
+    """
+    Temporarily change log level for a logger
+    
+    Args:
+        logger_name: Name of logger to modify
+        level: Temporary log level
+        
+    Yields:
+        None
+    """
+    logger = logging.getLogger(logger_name)
+    old_level = logger.level
+    
+    try:
+        logger.setLevel(level)
+        yield
+    finally:
+        logger.setLevel(old_level)
+
+
+def add_file_handler(logger: logging.Logger, file_path: str, log_level: int = logging.INFO):
+    """
+    Add a file handler to a logger
+    
+    Args:
+        logger: Logger to add handler to
+        file_path: Path to log file
+        log_level: Log level for the handler
+    """
+    # Create directory if it doesn't exist
+    log_dir = os.path.dirname(file_path)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+    
+    # Create handler
+    handler = logging.FileHandler(file_path)
+    handler.setLevel(log_level)
+    
+    # Add formatter
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    
+    # Add handler to logger
+    logger.addHandler(handler)
+
+
+def configure_from_settings():
+    """
+    Configure logging from application settings
+    """
+    if not settings:
+        print("WARNING: Settings module not available, using default logging configuration")
+        configure_logging()
+        return
+    
+    # Determine log directory
+    log_dir = settings.log_dir if hasattr(settings, 'log_dir') else "logs"
+    
+    # Get log level from settings
+    log_level = settings.log_level if hasattr(settings, 'log_level') else "INFO"
+    
+    # Determine if we should use JSON logging
+    use_json = settings.environment == "production" if hasattr(settings, 'environment') else False
+    log_format = "json" if use_json else "standard"
+    
+    # Configure logging
+    configure_logging(
+        log_level=log_level,
+        log_format=log_format,
+        log_dir=log_dir,
+        log_file="asira.log",
+        max_size_mb=50,
+        backup_count=10,
+        console_output=True,
+        app_name=settings.app_name if hasattr(settings, 'app_name') else "ASIRA",
+        suppress_loggers=[
+            "elasticsearch",
+            "urllib3.connectionpool",
+            "asyncio",
+            "sqlalchemy.engine"
+        ]
+    )
+
+
+# Initialize a basic logger for this module
+module_logger = logging.getLogger("asira.logging")
+
+# Module version information
+LOGGING_VERSION = "1.0.0"
+LOGGING_LAST_UPDATED = "2025-03-15 17:22:45"
+LOGGING_LAST_UPDATED_BY = "Rahul"
