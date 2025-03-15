@@ -1,6 +1,6 @@
 # ASIRA - Automated Security Incident Response Agent
 
-![ASIRA Logo](docs/images/asira_logo.png)
+![ASIRA Logo](docs/final_logo.jpg)
 
 *Version: 1.0.0*  
 *Last updated: 2025-03-15 12:38:13*  
