@@ -78,7 +78,6 @@ chmod +x install.sh
 # Run the installation script with root privileges
 sudo ./install.sh
 
-```
 
 
 
@@ -95,6 +94,10 @@ Directory Structure
 ├── docs/                  # Documentation
 ├── scripts/               # Installation and utility scripts
 └── requirements.txt       # Python dependencies
+```
+
+
+```bash
 
 Running Tests
 # Run all tests
@@ -105,7 +108,7 @@ python -m pytest --cov=src tests/
 
 # Run specific test file
 python -m pytest tests/test_detection.py
-
+```
 
 API Documentation
 For comprehensive API documentation, see API Documentation.
