@@ -6,7 +6,7 @@ The executor manages the secure execution environment, credentials handling,
 action verification, and result documentation for response playbooks.
 
 Version: 1.0.0
-Last updated: 2025-03-15 12:14:58
+Last updated: 2025-03-15 19:08:19
 Last updated by: Mritunjay-mj
 """
 
@@ -848,4 +848,810 @@ class PlaybookExecutor:
                     
         return processed
     
-    def _render_template(self, template_str: str, context: Dict[str, Any
+    def _render_template(self, template_str: str, context: Dict[str, Any]) -> str:
+        """
+        Render a template string using the execution context
+        
+        Args:
+            template_str: Template string with variables
+            context: Execution context
+            
+        Returns:
+            Rendered string with variables replaced
+        """
+        try:
+            template = self.template_env.from_string(template_str)
+            return template.render(**context)
+        except jinja2.exceptions.TemplateError as e:
+            logger.error(f"Template rendering error: {e}")
+            raise ValueError(f"Error rendering template: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error rendering template: {e}")
+            raise ValueError(f"Error rendering template: {e}")
+    
+    def _execute_command_action(
+        self, 
+        action, 
+        context: Dict[str, Any], 
+        sandbox_info: Dict[str, Any]
+    ) -> ActionResult:
+        """
+        Execute a command action
+        
+        Args:
+            action: Action to execute
+            context: Execution context
+            sandbox_info: Sandbox information
+            
+        Returns:
+            ActionResult with execution details
+        """
+        # Initialize result
+        result = ActionResult(
+            action_id=action.id,
+            status=ActionStatus.IN_PROGRESS,
+            start_time=datetime.datetime.now()
+        )
+        
+        # Check if command is provided
+        if not action.command:
+            result.status = ActionStatus.FAILED
+            result.error = "No command provided for command action"
+            result.end_time = datetime.datetime.now()
+            return result
+        
+        # Execute command in sandbox
+        timeout = action.timeout or 60
+        logger.info(f"Executing command: {action.command} with timeout {timeout}s")
+        
+        # Add any credentials needed for this command
+        env = dict(os.environ)
+        for param_name, param_value in action.parameters.items():
+            if param_name.startswith("credential_"):
+                credential_id = param_value
+                credential_value = self.credential_manager.get_credential(credential_id)
+                if credential_value:
+                    env_var_name = param_name.upper()
+                    env[env_var_name] = credential_value
+        
+        # Execute the command in the sandbox
+        execution_result = self.sandbox_manager.execute_in_sandbox(
+            sandbox_info=sandbox_info,
+            command=action.command,
+            env=env,
+            timeout=timeout
+        )
+        
+        # Process execution result
+        if execution_result["success"]:
+            result.status = ActionStatus.COMPLETED
+            result.output = execution_result["output"]
+        else:
+            result.status = ActionStatus.FAILED
+            result.error = execution_result["error"] or "Unknown error"
+            result.output = execution_result["output"]
+        
+        # Include execution details
+        result.details = {
+            "command": action.command,
+            "return_code": execution_result["return_code"],
+            "execution_time": execution_result["execution_time"]
+        }
+        
+        result.end_time = datetime.datetime.now()
+        return result
+    
+    def _execute_api_action(
+        self, 
+        action, 
+        context: Dict[str, Any]
+    ) -> ActionResult:
+        """
+        Execute an API call action
+        
+        Args:
+            action: Action to execute
+            context: Execution context
+            
+        Returns:
+            ActionResult with execution details
+        """
+        # Initialize result
+        result = ActionResult(
+            action_id=action.id,
+            status=ActionStatus.IN_PROGRESS,
+            start_time=datetime.datetime.now()
+        )
+        
+        # Check if API endpoint is provided
+        if not action.api_endpoint:
+            result.status = ActionStatus.FAILED
+            result.error = "No API endpoint provided for API action"
+            result.end_time = datetime.datetime.now()
+            return result
+        
+        # Check if API method is provided
+        method = action.api_method or "GET"
+        
+        try:
+            # Prepare headers
+            headers = {}
+            
+            # Add authentication if needed
+            if "auth_type" in action.parameters:
+                auth_type = action.parameters["auth_type"]
+                
+                if auth_type == "basic":
+                    if "username" in action.parameters and "password" in action.parameters:
+                        # Get credentials
+                        username = action.parameters["username"]
+                        password_id = action.parameters["password"]
+                        password = self.credential_manager.get_credential(password_id)
+                        
+                        if password:
+                            import base64
+                            auth_str = f"{username}:{password}"
+                            auth_bytes = auth_str.encode("ascii")
+                            auth_encoded = base64.b64encode(auth_bytes).decode("ascii")
+                            headers["Authorization"] = f"Basic {auth_encoded}"
+                        else:
+                            raise ValueError(f"Could not retrieve password for credential ID {password_id}")
+                            
+                elif auth_type == "bearer":
+                    if "token_id" in action.parameters:
+                        token_id = action.parameters["token_id"]
+                        token = self.credential_manager.get_credential(token_id)
+                        
+                        if token:
+                            headers["Authorization"] = f"Bearer {token}"
+                        else:
+                            raise ValueError(f"Could not retrieve token for credential ID {token_id}")
+                            
+                elif auth_type == "api_key":
+                    if "api_key_id" in action.parameters and "api_key_header" in action.parameters:
+                        api_key_id = action.parameters["api_key_id"]
+                        api_key_header = action.parameters["api_key_header"]
+                        api_key = self.credential_manager.get_credential(api_key_id)
+                        
+                        if api_key:
+                            headers[api_key_header] = api_key
+                        else:
+                            raise ValueError(f"Could not retrieve API key for credential ID {api_key_id}")
+            
+            # Add content type header for JSON payload
+            if action.api_payload:
+                headers["Content-Type"] = "application/json"
+            
+            # Add additional headers from parameters
+            if "headers" in action.parameters and isinstance(action.parameters["headers"], dict):
+                headers.update(action.parameters["headers"])
+            
+            # Prepare request parameters
+            timeout = action.timeout or 30
+            
+            # Log the request (excluding sensitive headers)
+            safe_headers = {k: "***" if k.lower() in ("authorization", "api-key") else v 
+                           for k, v in headers.items()}
+            logger.info(f"Making API request: {method} {action.api_endpoint}")
+            logger.debug(f"API headers: {safe_headers}")
+            
+            # Make the request
+            start_time = time.time()
+            
+            if method.upper() == "GET":
+                response = requests.get(
+                    action.api_endpoint,
+                    headers=headers,
+                    timeout=timeout,
+                    verify=action.parameters.get("verify_ssl", True)
+                )
+            elif method.upper() == "POST":
+                response = requests.post(
+                    action.api_endpoint,
+                    json=action.api_payload,
+                    headers=headers,
+                    timeout=timeout,
+                    verify=action.parameters.get("verify_ssl", True)
+                )
+            elif method.upper() == "PUT":
+                response = requests.put(
+                    action.api_endpoint,
+                    json=action.api_payload,
+                    headers=headers,
+                    timeout=timeout,
+                    verify=action.parameters.get("verify_ssl", True)
+                )
+            elif method.upper() == "DELETE":
+                response = requests.delete(
+                    action.api_endpoint,
+                    headers=headers,
+                    timeout=timeout,
+                    verify=action.parameters.get("verify_ssl", True)
+                )
+            else:
+                result.status = ActionStatus.FAILED
+                result.error = f"Unsupported HTTP method: {method}"
+                result.end_time = datetime.datetime.now()
+                return result
+                
+            # Process response
+            execution_time = time.time() - start_time
+            response_time_ms = int(execution_time * 1000)
+            
+            # Determine if request was successful
+            is_success = 200 <= response.status_code < 300
+            
+            if is_success:
+                result.status = ActionStatus.COMPLETED
+            else:
+                result.status = ActionStatus.FAILED
+                result.error = f"API request failed with status code {response.status_code}"
+            
+            # Parse response
+            try:
+                response_json = response.json()
+                result.output = json.dumps(response_json, indent=2)
+            except:
+                # Not JSON response
+                result.output = response.text
+            
+            # Include execution details
+            result.details = {
+                "method": method,
+                "endpoint": action.api_endpoint,
+                "status_code": response.status_code,
+                "response_time_ms": response_time_ms,
+                "content_type": response.headers.get("Content-Type", "")
+            }
+            
+        except requests.exceptions.Timeout:
+            result.status = ActionStatus.FAILED
+            result.error = f"API request timed out after {timeout} seconds"
+            
+        except requests.exceptions.RequestException as e:
+            result.status = ActionStatus.FAILED
+            result.error = f"API request error: {str(e)}"
+            
+        except Exception as e:
+            result.status = ActionStatus.FAILED
+            result.error = f"Error executing API action: {str(e)}"
+        
+        result.end_time = datetime.datetime.now()
+        return result
+    
+    def _execute_script_action(
+        self, 
+        action, 
+        context: Dict[str, Any], 
+        sandbox_info: Dict[str, Any]
+    ) -> ActionResult:
+        """
+        Execute a script action
+        
+        Args:
+            action: Action to execute
+            context: Execution context
+            sandbox_info: Sandbox information
+            
+        Returns:
+            ActionResult with execution details
+        """
+        # Initialize result
+        result = ActionResult(
+            action_id=action.id,
+            status=ActionStatus.IN_PROGRESS,
+            start_time=datetime.datetime.now()
+        )
+        
+        # Check if script is provided
+        if not action.script:
+            result.status = ActionStatus.FAILED
+            result.error = "No script provided for script action"
+            result.end_time = datetime.datetime.now()
+            return result
+        
+        try:
+            # Create a temporary script file in the sandbox
+            script_path = os.path.join(sandbox_info["path"], f"script_{action.id}.sh")
+            with open(script_path, "w") as f:
+                f.write(action.script)
+            
+            # Make script executable
+            os.chmod(script_path, 0o755)
+            
+            # Execute the script
+            command = f"{script_path} {action.parameters.get('arguments', '')}"
+            
+            # Add any environment variables needed for this script
+            env = dict(os.environ)
+            for param_name, param_value in action.parameters.items():
+                if param_name.startswith("env_"):
+                    env_var_name = param_name[4:].upper()
+                    env[env_var_name] = param_value
+                elif param_name.startswith("credential_"):
+                    credential_id = param_value
+                    credential_value = self.credential_manager.get_credential(credential_id)
+                    if credential_value:
+                        env_var_name = param_name.upper()
+                        env[env_var_name] = credential_value
+            
+            timeout = action.timeout or 120
+            
+            # Execute the script command in the sandbox
+            execution_result = self.sandbox_manager.execute_in_sandbox(
+                sandbox_info=sandbox_info,
+                command=command,
+                env=env,
+                timeout=timeout
+            )
+            
+            # Process execution result
+            if execution_result["success"]:
+                result.status = ActionStatus.COMPLETED
+                result.output = execution_result["output"]
+            else:
+                result.status = ActionStatus.FAILED
+                result.error = execution_result["error"] or "Unknown error"
+                result.output = execution_result["output"]
+            
+            # Include execution details
+            result.details = {
+                "script_path": script_path,
+                "return_code": execution_result["return_code"],
+                "execution_time": execution_result["execution_time"]
+            }
+            
+            # Clean up script file
+            try:
+                os.remove(script_path)
+            except:
+                pass
+            
+        except Exception as e:
+            result.status = ActionStatus.FAILED
+            result.error = f"Error executing script action: {str(e)}"
+        
+        result.end_time = datetime.datetime.now()
+        return result
+    
+    def _execute_notification_action(
+        self, 
+        action, 
+        context: Dict[str, Any]
+    ) -> ActionResult:
+        """
+        Execute a notification action
+        
+        Args:
+            action: Action to execute
+            context: Execution context
+            
+        Returns:
+            ActionResult with execution details
+        """
+        # Initialize result
+        result = ActionResult(
+            action_id=action.id,
+            status=ActionStatus.IN_PROGRESS,
+            start_time=datetime.datetime.now()
+        )
+        
+        # Check if template or message is provided
+        if not action.template:
+            result.status = ActionStatus.FAILED
+            result.error = "No template provided for notification action"
+            result.end_time = datetime.datetime.now()
+            return result
+        
+        # Check if channels are provided
+        if not action.channels:
+            result.status = ActionStatus.FAILED
+            result.error = "No channels provided for notification action"
+            result.end_time = datetime.datetime.now()
+            return result
+        
+        try:
+            # Import notification functions
+            from src.response.notifications import (
+                send_email_notification,
+                send_slack_notification,
+                send_sms_notification,
+                send_webhook_notification
+            )
+            
+            # Process the template
+            notification_content = action.template
+            
+            # Send notifications to specified channels
+            success_channels = []
+            failed_channels = {}
+            
+            for channel in action.channels:
+                try:
+                    if channel == "email":
+                        recipients = action.parameters.get("email_recipients", [])
+                        subject = action.parameters.get("email_subject", "Security Incident Notification")
+                        
+                        if not recipients:
+                            failed_channels[channel] = "No recipients specified"
+                            continue
+                            
+                        send_email_notification(recipients, subject, notification_content)
+                        success_channels.append(channel)
+                        
+                    elif channel == "slack":
+                        webhook_url = action.parameters.get("slack_webhook_url", "")
+                        webhook_id = action.parameters.get("slack_webhook_id", "")
+                        
+                        # Get webhook URL from credential manager if ID is provided
+                        if not webhook_url and webhook_id:
+                            webhook_url = self.credential_manager.get_credential(webhook_id)
+                        
+                        if not webhook_url:
+                            failed_channels[channel] = "No webhook URL specified"
+                            continue
+                            
+                        send_slack_notification(webhook_url, notification_content)
+                        success_channels.append(channel)
+                        
+                    elif channel == "sms":
+                        phone_numbers = action.parameters.get("phone_numbers", [])
+                        
+                        if not phone_numbers:
+                            failed_channels[channel] = "No phone numbers specified"
+                            continue
+                            
+                        send_sms_notification(phone_numbers, notification_content)
+                        success_channels.append(channel)
+                        
+                    elif channel == "webhook":
+                        webhook_url = action.parameters.get("webhook_url", "")
+                        webhook_id = action.parameters.get("webhook_id", "")
+                        webhook_method = action.parameters.get("webhook_method", "POST")
+                        
+                        # Get webhook URL from credential manager if ID is provided
+                        if not webhook_url and webhook_id:
+                            webhook_url = self.credential_manager.get_credential(webhook_id)
+                        
+                        if not webhook_url:
+                            failed_channels[channel] = "No webhook URL specified"
+                            continue
+                            
+                        send_webhook_notification(webhook_url, notification_content, method=webhook_method)
+                        success_channels.append(channel)
+                        
+                    else:
+                        failed_channels[channel] = f"Unknown notification channel: {channel}"
+                        
+                except Exception as e:
+                    failed_channels[channel] = str(e)
+            
+            # Determine overall status
+            if success_channels:
+                if failed_channels:
+                    # Some channels succeeded, some failed
+                    result.status = ActionStatus.PARTIAL
+                    result.error = f"Failed to send to some channels: {failed_channels}"
+                else:
+                    # All channels succeeded
+                    result.status = ActionStatus.COMPLETED
+            else:
+                # All channels failed
+                result.status = ActionStatus.FAILED
+                result.error = f"Failed to send to all channels: {failed_channels}"
+            
+            # Include details
+            result.output = f"Notification sent successfully to: {', '.join(success_channels)}"
+            result.details = {
+                "success_channels": success_channels,
+                "failed_channels": failed_channels,
+                "content_length": len(notification_content)
+            }
+            
+        except Exception as e:
+            result.status = ActionStatus.FAILED
+            result.error = f"Error executing notification action: {str(e)}"
+        
+        result.end_time = datetime.datetime.now()
+        return result
+    
+    def _execute_containment_action(
+        self, 
+        action, 
+        context: Dict[str, Any], 
+        sandbox_info: Dict[str, Any]
+    ) -> ActionResult:
+        """
+        Execute a containment action
+        
+        Args:
+            action: Action to execute
+            context: Execution context
+            sandbox_info: Sandbox information
+            
+        Returns:
+            ActionResult with execution details
+        """
+        # Initialize result
+        result = ActionResult(
+            action_id=action.id,
+            status=ActionStatus.IN_PROGRESS,
+            start_time=datetime.datetime.now()
+        )
+        
+        # Check if target is provided
+        if not action.target:
+            result.status = ActionStatus.FAILED
+            result.error = "No target provided for containment action"
+            result.end_time = datetime.datetime.now()
+            return result
+        
+        try:
+            # Import containment functions
+            from src.response.containment import (
+                isolate_host,
+                block_ip,
+                block_user,
+                disable_account
+            )
+            
+            # Determine containment type
+            containment_type = action.parameters.get("containment_type", "")
+            target = action.target
+            
+            if containment_type == "isolate_host":
+                success, message = isolate_host(target)
+                if success:
+                    result.status = ActionStatus.COMPLETED
+                    result.output = message
+                else:
+                    result.status = ActionStatus.FAILED
+                    result.error = message
+            
+            elif containment_type == "block_ip":
+                duration = action.parameters.get("duration", 3600)  # Default 1 hour
+                success, message = block_ip(target, duration)
+                if success:
+                    result.status = ActionStatus.COMPLETED
+                    result.output = message
+                else:
+                    result.status = ActionStatus.FAILED
+                    result.error = message
+            
+            elif containment_type == "block_user":
+                success, message = block_user(target)
+                if success:
+                    result.status = ActionStatus.COMPLETED
+                    result.output = message
+                else:
+                    result.status = ActionStatus.FAILED
+                    result.error = message
+            
+            elif containment_type == "disable_account":
+                success, message = disable_account(target)
+                if success:
+                    result.status = ActionStatus.COMPLETED
+                    result.output = message
+                else:
+                    result.status = ActionStatus.FAILED
+                    result.error = message
+            
+            else:
+                result.status = ActionStatus.FAILED
+                result.error = f"Unknown containment type: {containment_type}"
+                
+            # Include details
+            result.details = {
+                "containment_type": containment_type,
+                "target": target
+            }
+            
+        except Exception as e:
+            result.status = ActionStatus.FAILED
+            result.error = f"Error executing containment action: {str(e)}"
+        
+        result.end_time = datetime.datetime.now()
+        return result
+    
+    def _execute_enrichment_action(
+        self, 
+        action, 
+        context: Dict[str, Any]
+    ) -> ActionResult:
+        """
+        Execute an enrichment action
+        
+        Args:
+            action: Action to execute
+            context: Execution context
+            
+        Returns:
+            ActionResult with execution details
+        """
+        # Initialize result
+        result = ActionResult(
+            action_id=action.id,
+            status=ActionStatus.IN_PROGRESS,
+            start_time=datetime.datetime.now()
+        )
+        
+        # Check if target is provided
+        if not action.target:
+            result.status = ActionStatus.FAILED
+            result.error = "No target provided for enrichment action"
+            result.end_time = datetime.datetime.now()
+            return result
+        
+        try:
+            # Import enrichment functions
+            from src.response.enrichment import (
+                lookup_ip,
+                lookup_domain,
+                lookup_file_hash,
+                lookup_user
+            )
+            
+            # Determine enrichment type
+            enrichment_type = action.parameters.get("enrichment_type", "")
+            target = action.target
+            
+            if enrichment_type == "ip_lookup":
+                data = lookup_ip(target)
+                result.status = ActionStatus.COMPLETED
+                result.output = json.dumps(data, indent=2)
+                result.details = {
+                    "enrichment_type": enrichment_type,
+                    "target": target,
+                    "data_fields": list(data.keys())
+                }
+            
+            elif enrichment_type == "domain_lookup":
+                data = lookup_domain(target)
+                result.status = ActionStatus.COMPLETED
+                result.output = json.dumps(data, indent=2)
+                result.details = {
+                    "enrichment_type": enrichment_type,
+                    "target": target,
+                    "data_fields": list(data.keys())
+                }
+            
+            elif enrichment_type == "file_hash_lookup":
+                data = lookup_file_hash(target)
+                result.status = ActionStatus.COMPLETED
+                result.output = json.dumps(data, indent=2)
+                result.details = {
+                    "enrichment_type": enrichment_type,
+                    "target": target,
+                    "data_fields": list(data.keys())
+                }
+            
+            elif enrichment_type == "user_lookup":
+                data = lookup_user(target)
+                result.status = ActionStatus.COMPLETED
+                result.output = json.dumps(data, indent=2)
+                result.details = {
+                    "enrichment_type": enrichment_type,
+                    "target": target,
+                    "data_fields": list(data.keys())
+                }
+            
+            else:
+                result.status = ActionStatus.FAILED
+                result.error = f"Unknown enrichment type: {enrichment_type}"
+            
+        except Exception as e:
+            result.status = ActionStatus.FAILED
+            result.error = f"Error executing enrichment action: {str(e)}"
+        
+        result.end_time = datetime.datetime.now()
+        return result
+    
+    def _create_summary_report(
+        self, 
+        execution_path: str, 
+        playbook: PlaybookDefinition, 
+        summary: Dict[str, Any]
+    ) -> None:
+        """
+        Create a human-readable summary report of the execution
+        
+        Args:
+            execution_path: Path to execution directory
+            playbook: Playbook definition
+            summary: Execution summary data
+        """
+        try:
+            # Create a markdown report
+            report_path = os.path.join(execution_path, "report.md")
+            
+            with open(report_path, "w") as f:
+                f.write(f"# Playbook Execution Report\n\n")
+                f.write(f"## Overview\n\n")
+                f.write(f"- **Playbook**: {playbook.name}\n")
+                f.write(f"- **Description**: {playbook.description}\n")
+                f.write(f"- **Execution ID**: {summary['execution_id']}\n")
+                f.write(f"- **Status**: {summary['status'].upper()}\n")
+                
+                # Format timestamps
+                start_time = datetime.datetime.fromtimestamp(summary['start_time']).strftime("%Y-%m-%d %H:%M:%S")
+                end_time = datetime.datetime.fromtimestamp(summary['end_time']).strftime("%Y-%m-%d %H:%M:%S")
+                duration = summary['end_time'] - summary['start_time']
+                
+                f.write(f"- **Start Time**: {start_time}\n")
+                f.write(f"- **End Time**: {end_time}\n")
+                f.write(f"- **Duration**: {duration:.2f} seconds\n")
+                
+                # Actions summary
+                f.write(f"\n## Actions Summary\n\n")
+                
+                for i, action in enumerate(summary['actions']):
+                    status = action['status'].upper()
+                    status_indicator = "✅" if status == "COMPLETED" else "❌" if status == "FAILED" else "⚠️"
+                    
+                    f.write(f"### {i+1}. {action['action_id']} {status_indicator}\n\n")
+                    
+                    # Action details
+                    if action.get('error'):
+                        f.write(f"**Error**: {action['error']}\n\n")
+                    
+                    if action.get('output'):
+                        f.write(f"**Output**:\n```\n{action['output'][:500]}")
+                        if len(action['output']) > 500:
+                            f.write("\n... (output truncated)")
+                        f.write("\n```\n\n")
+                    
+                    if action.get('details'):
+                        f.write("**Details**:\n\n")
+                        for k, v in action['details'].items():
+                            f.write(f"- {k}: {v}\n")
+                    
+                    f.write("\n")
+                
+                # Final status
+                if summary['status'] == "completed":
+                    f.write("\n## Result: All actions completed successfully ✅\n")
+                elif summary['status'] == "partial":
+                    f.write("\n## Result: Some actions completed with issues ⚠️\n")
+                else:
+                    f.write("\n## Result: Execution failed ❌\n")
+            
+            logger.info(f"Created summary report at {report_path}")
+            
+        except Exception as e:
+            logger.error(f"Error creating summary report: {e}")
+
+
+# Create a singleton executor
+_playbook_executor = None
+
+def get_playbook_executor(config: Dict[str, Any] = None) -> PlaybookExecutor:
+    """
+    Get or create the singleton PlaybookExecutor
+    
+    Args:
+        config: Optional configuration
+        
+    Returns:
+        PlaybookExecutor instance
+    """
+    global _playbook_executor
+    
+    if _playbook_executor is None:
+        if config is None:
+            # Use default config
+            config = {
+                "sandbox_type": ExecutionEnvironment.SUBPROCESS.value,
+                "execution_dir": "/tmp/asira/execution",
+                "playbook_dir": os.environ.get("ASIRA_PLAYBOOK_DIR", "/etc/asira/playbooks"),
+                "max_execution_time": 300
+            }
+        
+        _playbook_executor = PlaybookExecutor(config)
+    
+    return _playbook_executor
+
+
+# Module version and info
+__version__ = "1.0.0"
+__last_updated__ = "2025-03-15 19:10:34"
+__author__ = "Rahul"
