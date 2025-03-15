@@ -5,14 +5,18 @@ Provides connections to PostgreSQL, Elasticsearch and Redis,
 along with helper functions for common database operations.
 
 Version: 1.0.0
-Last updated: 2025-03-15 17:10:53
+Last updated: 2025-03-15 17:18:51
 Last updated by: Rahul
 """
 import logging
 import time
 import json
 import uuid
+import hashlib
+import re
+import ipaddress
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, Any, List, Optional, Callable, TypeVar, Generic, Union, Tuple, Set, Iterator
 from contextlib import contextmanager
 
@@ -363,6 +367,400 @@ def paginate(query: Query, page: int = 1, page_size: int = 20) -> Tuple[List[Any
     
     return items, total_count, total_pages
 
+
+# Elasticsearch helper functions
+def es_index_document(index: str, document: Dict[str, Any], doc_id: str = None) -> Dict[str, Any]:
+    """
+    Index a document in Elasticsearch
+    
+    Args:
+        index: Index name
+        document: Document to index
+        doc_id: Document ID (optional, will be generated if not provided)
+        
+    Returns:
+        Elasticsearch response
+    """
+    if not es_client:
+        logger.warning("Elasticsearch client not available, couldn't index document")
+        return {"error": "Elasticsearch not available", "success": False}
+    
+    # Add timestamp if not present
+    if "timestamp" not in document:
+        document["timestamp"] = get_timestamp()
+        
+    # Add full index name with prefix
+    full_index = f"{settings.es_index_prefix}{index}" if not index.startswith(settings.es_index_prefix) else index
+        
+    try:
+        # Create index with mappings if it doesn't exist
+        if not es_client.indices.exists(index=full_index):
+            es_client.indices.create(
+                index=full_index,
+                body={
+                    "settings": {
+                        "number_of_shards": settings.es_shards,
+                        "number_of_replicas": settings.es_replicas
+                    }
+                },
+                ignore=400  # Ignore error if index already exists
+            )
+        
+        # Index document
+        response = es_client.index(
+            index=full_index,
+            body=document,
+            id=doc_id,
+            refresh="wait_for"  # Ensure document is immediately searchable
+        )
+        
+        logger.debug(f"Indexed document in {full_index}: {doc_id}")
+        return {"success": True, "id": response.get("_id", doc_id), "result": response.get("result")}
+    
+    except Exception as e:
+        logger.error(f"Error indexing document in {full_index}: {e}")
+        return {"error": str(e), "success": False}
+
+
+def es_update_document(index: str, doc_id: str, update_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Update a document in Elasticsearch
+    
+    Args:
+        index: Index name
+        doc_id: Document ID
+        update_data: Data to update
+        
+    Returns:
+        Elasticsearch response
+    """
+    if not es_client:
+        logger.warning("Elasticsearch client not available, couldn't update document")
+        return {"error": "Elasticsearch not available", "success": False}
+    
+    # Add full index name with prefix
+    full_index = f"{settings.es_index_prefix}{index}" if not index.startswith(settings.es_index_prefix) else index
+    
+    try:
+        response = es_client.update(
+            index=full_index,
+            id=doc_id,
+            body={"doc": update_data},
+            refresh="wait_for"
+        )
+        
+        logger.debug(f"Updated document in {full_index}: {doc_id}")
+        return {"success": True, "id": doc_id, "result": response.get("result")}
+    
+    except NotFoundError:
+        logger.warning(f"Document not found for update in {full_index}: {doc_id}")
+        return {"error": "Document not found", "success": False}
+    
+    except Exception as e:
+        logger.error(f"Error updating document in {full_index}: {e}")
+        return {"error": str(e), "success": False}
+
+
+def es_delete_document(index: str, doc_id: str) -> Dict[str, Any]:
+    """
+    Delete a document from Elasticsearch
+    
+    Args:
+        index: Index name
+        doc_id: Document ID
+        
+    Returns:
+        Elasticsearch response
+    """
+    if not es_client:
+        logger.warning("Elasticsearch client not available, couldn't delete document")
+        return {"error": "Elasticsearch not available", "success": False}
+    
+    # Add full index name with prefix
+    full_index = f"{settings.es_index_prefix}{index}" if not index.startswith(settings.es_index_prefix) else index
+    
+    try:
+        response = es_client.delete(
+            index=full_index,
+            id=doc_id,
+            refresh="wait_for"
+        )
+        
+        logger.debug(f"Deleted document from {full_index}: {doc_id}")
+        return {"success": True, "id": doc_id, "result": response.get("result")}
+    
+    except NotFoundError:
+        logger.warning(f"Document not found for deletion in {full_index}: {doc_id}")
+        return {"error": "Document not found", "success": False}
+    
+    except Exception as e:
+        logger.error(f"Error deleting document from {full_index}: {e}")
+        return {"error": str(e), "success": False}
+
+
+def es_search(index: str, query: Dict[str, Any], size: int = 10, from_: int = 0) -> Dict[str, Any]:
+    """
+    Search documents in Elasticsearch
+    
+    Args:
+        index: Index name
+        query: Elasticsearch query
+        size: Number of documents to return
+        from_: Number of documents to skip
+        
+    Returns:
+        Elasticsearch response
+    """
+    if not es_client:
+        logger.warning("Elasticsearch client not available, couldn't search documents")
+        return {"error": "Elasticsearch not available", "success": False, "hits": [], "total": 0}
+    
+    # Add full index name with prefix
+    full_index = f"{settings.es_index_prefix}{index}" if not index.startswith(settings.es_index_prefix) else index
+    
+    try:
+        response = es_client.search(
+            index=full_index,
+            body=query,
+            size=size,
+            from_=from_
+        )
+        
+        hits = response.get("hits", {})
+        total = hits.get("total", {}).get("value", 0)
+        
+        logger.debug(f"Search in {full_index} returned {total} results")
+        return {
+            "success": True, 
+            "hits": hits.get("hits", []), 
+            "total": total,
+            "aggregations": response.get("aggregations", {})
+        }
+    
+    except Exception as e:
+        logger.error(f"Error searching documents in {full_index}: {e}")
+        return {"error": str(e), "success": False, "hits": [], "total": 0}
+
+
+def es_bulk_index(index: str, documents: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Bulk index documents in Elasticsearch
+    
+    Args:
+        index: Index name
+        documents: List of documents to index
+        
+    Returns:
+        Elasticsearch response
+    """
+    if not es_client:
+        logger.warning("Elasticsearch client not available, couldn't bulk index documents")
+        return {"error": "Elasticsearch not available", "success": False}
+    
+    # Add full index name with prefix
+    full_index = f"{settings.es_index_prefix}{index}" if not index.startswith(settings.es_index_prefix) else index
+    
+    try:
+        # Create index with mappings if it doesn't exist
+        if not es_client.indices.exists(index=full_index):
+            es_client.indices.create(
+                index=full_index,
+                body={
+                    "settings": {
+                        "number_of_shards": settings.es_shards,
+                        "number_of_replicas": settings.es_replicas
+                    }
+                },
+                ignore=400  # Ignore error if index already exists
+            )
+        
+        # Prepare actions for bulk indexing
+        actions = []
+        for doc in documents:
+            # Add timestamp if not present
+            if "timestamp" not in doc:
+                doc["timestamp"] = get_timestamp()
+                
+            # Generate ID if not present
+            doc_id = doc.get("id")
+            
+            action = {
+                "_index": full_index,
+                "_source": doc
+            }
+            
+            if doc_id:
+                action["_id"] = doc_id
+                
+            actions.append(action)
+        
+        # Execute bulk operation
+        success, failed = helpers.bulk(
+            es_client,
+            actions,
+            stats_only=True,
+            raise_on_error=False
+        )
+        
+        logger.info(f"Bulk indexed {success} documents in {full_index}, {failed} failed")
+        return {
+            "success": failed == 0,
+            "indexed": success,
+            "failed": failed
+        }
+    
+    except Exception as e:
+        logger.error(f"Error bulk indexing documents in {full_index}: {e}")
+        return {"error": str(e), "success": False}
+
+
+# Redis helper functions
+def redis_set(key: str, value: Any, expire: int = None) -> bool:
+    """
+    Set a value in Redis
+    
+    Args:
+        key: Key name
+        value: Value to store
+        expire: Expiration time in seconds (optional)
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    if not redis_client:
+        logger.warning("Redis client not available, couldn't set value")
+        return False
+    
+    # Add prefix to key
+    full_key = f"{settings.redis_key_prefix}{key}"
+    
+    try:
+        # Convert complex objects to JSON
+        if isinstance(value, (dict, list)):
+            value = json.dumps(value)
+            
+        redis_client.set(full_key, value, ex=expire)
+        return True
+    
+    except Exception as e:
+        logger.error(f"Error setting Redis key {full_key}: {e}")
+        return False
+
+
+def redis_get(key: str, default: Any = None) -> Any:
+    """
+    Get a value from Redis
+    
+    Args:
+        key: Key name
+        default: Default value to return if key doesn't exist
+        
+    Returns:
+        Value if key exists, default otherwise
+    """
+    if not redis_client:
+        logger.warning("Redis client not available, couldn't get value")
+        return default
+    
+    # Add prefix to key
+    full_key = f"{settings.redis_key_prefix}{key}"
+    
+    try:
+        value = redis_client.get(full_key)
+        
+        if value is None:
+            return default
+            
+        # Try to parse as JSON
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return value
+    
+    except Exception as e:
+        logger.error(f"Error getting Redis key {full_key}: {e}")
+        return default
+
+
+def redis_delete(key: str) -> bool:
+    """
+    Delete a key from Redis
+    
+    Args:
+        key: Key name
+        
+    Returns:
+        True if key was deleted, False otherwise
+    """
+    if not redis_client:
+        logger.warning("Redis client not available, couldn't delete key")
+        return False
+    
+    # Add prefix to key
+    full_key = f"{settings.redis_key_prefix}{key}"
+    
+    try:
+        result = redis_client.delete(full_key)
+        return result > 0
+    
+    except Exception as e:
+        logger.error(f"Error deleting Redis key {full_key}: {e}")
+        return False
+
+
+def redis_increment(key: str, amount: int = 1) -> Optional[int]:
+    """
+    Increment a counter in Redis
+    
+    Args:
+        key: Key name
+        amount: Amount to increment by
+        
+    Returns:
+        New value after increment, None if failed
+    """
+    if not redis_client:
+        logger.warning("Redis client not available, couldn't increment counter")
+        return None
+    
+    # Add prefix to key
+    full_key = f"{settings.redis_key_prefix}{key}"
+    
+    try:
+        return redis_client.incr(full_key, amount)
+    
+    except Exception as e:
+        logger.error(f"Error incrementing Redis key {full_key}: {e}")
+        return None
+
+
+def redis_expire(key: str, seconds: int) -> bool:
+    """
+    Set expiration time for a key
+    
+    Args:
+        key: Key name
+        seconds: Expiration time in seconds
+        
+    Returns:
+        True if expiration was set, False otherwise
+    """
+    if not redis_client:
+        logger.warning("Redis client not available, couldn't set expiration")
+        return False
+    
+    # Add prefix to key
+    full_key = f"{settings.redis_key_prefix}{key}"
+    
+    try:
+        return redis_client.expire(full_key, seconds)
+    
+    except Exception as e:
+        logger.error(f"Error setting expiration for Redis key {full_key}: {e}")
+        return False
+
+
+# Utility functions
 def sanitize_query_param(param: str) -> str:
     """
     Sanitize a query parameter to prevent SQL injection
@@ -385,6 +783,7 @@ def sanitize_query_param(param: str) -> str:
         
     return result
 
+
 def generate_uuid() -> str:
     """
     Generate a UUID for use as an ID
@@ -394,6 +793,7 @@ def generate_uuid() -> str:
     """
     return str(uuid.uuid4())
 
+
 def get_timestamp() -> float:
     """
     Get current timestamp in seconds since epoch
@@ -402,6 +802,7 @@ def get_timestamp() -> float:
         Current timestamp as float
     """
     return datetime.now().timestamp()
+
 
 def format_datetime(timestamp: float) -> str:
     """
@@ -415,6 +816,7 @@ def format_datetime(timestamp: float) -> str:
     """
     dt = datetime.fromtimestamp(timestamp)
     return dt.strftime("%Y-%m-%d %H:%M:%S")
+
 
 def hash_file(file_path: Path) -> str:
     """
@@ -435,6 +837,7 @@ def hash_file(file_path: Path) -> str:
             
     return sha256.hexdigest()
 
+
 def validate_ip(ip_address: str) -> bool:
     """
     Validate if a string is a valid IP address
@@ -451,6 +854,7 @@ def validate_ip(ip_address: str) -> bool:
     except ValueError:
         return False
 
+
 def is_valid_domain(domain: str) -> bool:
     """
     Validate if a string is a valid domain name
@@ -463,6 +867,7 @@ def is_valid_domain(domain: str) -> bool:
     """
     pattern = r"^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$"
     return bool(re.match(pattern, domain))
+
 
 def safe_execute(func, *args, default_return=None, **kwargs):
     """
@@ -483,6 +888,7 @@ def safe_execute(func, *args, default_return=None, **kwargs):
         logger.exception(f"Error executing {func.__name__}: {e}")
         return default_return
 
+
 def truncate_string(s: str, max_length: int = 100) -> str:
     """
     Truncate a string to maximum length, adding ellipsis if truncated
@@ -500,6 +906,90 @@ def truncate_string(s: str, max_length: int = 100) -> str:
         return s
     return s[:max_length-3] + "..."
 
+
+def get_table_metadata(table_name: str) -> Optional[Dict[str, Any]]:
+    """
+    Get metadata for a database table
+    
+    Args:
+        table_name: Table name
+        
+    Returns:
+        Dictionary with table metadata or None if table doesn't exist
+    """
+    if engine is None:
+        logger.warning("Database engine not available, couldn't get table metadata")
+        return None
+    
+    try:
+        meta = MetaData()
+        meta.reflect(bind=engine)
+        
+        if table_name not in meta.tables:
+            return None
+            
+        table = meta.tables[table_name]
+        inspector = inspect(engine)
+        
+        columns = []
+        for column in table.columns:
+            columns.append({
+                "name": column.name,
+                "type": str(column.type),
+                "nullable": column.nullable,
+                "primary_key": column.primary_key
+            })
+            
+        indexes = inspector.get_indexes(table_name)
+        pk_constraint = inspector.get_pk_constraint(table_name)
+        
+        return {
+            "name": table_name,
+            "columns": columns,
+            "indexes": indexes,
+            "primary_key": pk_constraint,
+            "schema": table.schema
+        }
+    
+    except Exception as e:
+        logger.error(f"Error getting metadata for table {table_name}: {e}")
+        return None
+
+
+def check_es_connection() -> bool:
+    """
+    Check if Elasticsearch connection is working
+    
+    Returns:
+        True if connection is working, False otherwise
+    """
+    if not es_client:
+        return False
+        
+    try:
+        return es_client.ping()
+    except Exception as e:
+        logger.error(f"Elasticsearch connection check failed: {e}")
+        return False
+
+
+def check_redis_connection() -> bool:
+    """
+    Check if Redis connection is working
+    
+    Returns:
+        True if connection is working, False otherwise
+    """
+    if not redis_client:
+        return False
+        
+    try:
+        return redis_client.ping()
+    except Exception as e:
+        logger.error(f"Redis connection check failed: {e}")
+        return False
+
+
 def get_module_version() -> Dict[str, str]:
     """
     Get version information for this module
@@ -508,12 +998,13 @@ def get_module_version() -> Dict[str, str]:
         Dictionary with version information
     """
     return {
-        "version": "1.0.0",
-        "last_updated": "2025-03-15 17:13:00",
-        "last_updated_by": "Mritunjay-mj"
+        "version": MODULE_VERSION,
+        "last_updated": MODULE_LAST_UPDATED,
+        "last_updated_by": MODULE_LAST_UPDATED_BY
     }
+
 
 # Export version information for this module
 MODULE_VERSION = "1.0.0"
-MODULE_LAST_UPDATED = "2025-03-15 17:13:00"
+MODULE_LAST_UPDATED = "2025-03-15 17:18:51"
 MODULE_LAST_UPDATED_BY = "Rahul"
