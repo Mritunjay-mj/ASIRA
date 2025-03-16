@@ -171,11 +171,48 @@ cleanup_actions:
     type: command
     description: Archive the login history for future reference
     command: |
-      if [ -f "{variables.login_history_path}" ]; then
-        mkdir -p /var/log/asira/incidents/{incident.id}
-        cp {variables.login_history_path} /var/log/asira/incidents/{incident.id}/login_history.json
-        echo "Login history archived to /var/log/asira/incidents/{incident.id}/login_history.json"
+      #!/bin/bash
+      # Archive login history from the incident investigation
+      # Created: 2025-03-16 13:15:54
+      # Author: Mritunjay-mj
+      
+      # Define variables
+      LOG_PATH="{variables.login_history_path}"
+      ARCHIVE_DIR="/var/log/asira/incidents/{incident.id}"
+      ARCHIVE_FILE="$ARCHIVE_DIR/login_history.json"
+      
+      # Check if source file exists
+      if [ -f "$LOG_PATH" ]; then
+        echo "[+] Found login history file: $LOG_PATH"
+        
+        # Create archive directory with proper permissions
+        mkdir -p "$ARCHIVE_DIR" || { 
+          echo "[-] Error: Failed to create archive directory" >&2
+          exit 1
+        }
+        
+        # Copy file with verification
+        cp "$LOG_PATH" "$ARCHIVE_FILE" && {
+          echo "[+] Login history archived successfully to $ARCHIVE_FILE"
+          
+          # Verify copy was successful
+          if cmp -s "$LOG_PATH" "$ARCHIVE_FILE"; then
+            echo "[+] Archive verification successful"
+            chmod 640 "$ARCHIVE_FILE"  # Set secure permissions
+          else
+            echo "[-] Warning: Archive verification failed" >&2
+          fi
+        } || {
+          echo "[-] Error: Failed to archive login history" >&2
+          exit 2
+        }
       else
-        echo "No login history to archive"
+        echo "[*] No login history file found at $LOG_PATH"
+        echo "[*] Nothing to archive"
       fi
-    timeout: 30
+      
+      # Remove original file if successful
+      if [ -f "$ARCHIVE_FILE" ]; then
+        rm -f "$LOG_PATH" && echo "[+] Cleaned up temporary log file"
+      fi
+    timeout: 45
