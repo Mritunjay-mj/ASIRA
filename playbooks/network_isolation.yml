@@ -1,25 +1,101 @@
 # ASIRA Network Isolation Playbook
-# Version: 1.0.0
-# Last updated: 2025-03-15 12:34:22
+# Version: 1.0.1
+# Last updated: 2025-03-16 13:19:33
 # Author: Mritunjay-mj
+# Description: This playbook automates the process of isolating a compromised network segment
+#              to contain threats and prevent lateral movement while enabling investigation.
 
 id: pb_network_isolation
 name: Network Segment Isolation
-description: Isolate a compromised network segment to prevent lateral movement
+description: Isolate a compromised network segment to prevent lateral movement and contain security threats
 execution_mode: sequential
 enabled: true
-version: 1.0.0
+version: 1.0.1
 created_at: 1741784062
-updated_at: 1741784062
-author: Mritunjay-mj
+updated_at: 1746458373  # Timestamp for 2025-03-16 13:19:33
+author: Rahul
 
 actions:
+  - id: validate_inputs
+    type: script
+    description: Validate input parameters and incident data
+    script: |
+      #!/bin/python3
+      import json
+      import os
+      import sys
+      
+      # Verify required input files exist
+      network_data_file = "{incident.network_data}"
+      if not os.path.exists(network_data_file):
+          print(f"ERROR: Network data file not found: {network_data_file}")
+          sys.exit(1)
+          
+      # Validate file format
+      try:
+          with open(network_data_file, "r") as f:
+              data = json.load(f)
+              
+          # Check for required fields
+          required_fields = ["source_ips", "affected_assets"]
+          missing_fields = [field for field in required_fields if field not in data]
+          
+          if missing_fields:
+              print(f"ERROR: Missing required fields in network data: {', '.join(missing_fields)}")
+              sys.exit(1)
+              
+          # Validate IP format (basic check)
+          for ip in data["source_ips"]:
+              octets = ip.split('.')
+              if len(octets) != 4 or not all(o.isdigit() and 0 <= int(o) <= 255 for o in octets):
+                  print(f"WARNING: Invalid IP format detected: {ip}")
+                  
+          print("Input validation successful")
+          
+      except json.JSONDecodeError:
+          print(f"ERROR: Invalid JSON format in network data file")
+          sys.exit(1)
+          
+    continue_on_failure: false
+    timeout: 60
+
   - id: identify_segment
     type: enrichment
     description: Identify the network segment to isolate
     script: |
       #!/bin/python3
       import json
+      import ipaddress
+      import os
+      
+      def determine_subnet(ip_list):
+          """Determine the common subnet for a list of IP addresses"""
+          try:
+              # Convert string IPs to IPv4Network objects
+              networks = [ipaddress.IPv4Address(ip) for ip in ip_list]
+              
+              # If only one IP, use /32 mask
+              if len(networks) == 1:
+                  return f"{networks[0]}/32"
+                  
+              # For multiple IPs, find common subnet
+              # This is a simplified approach - in real scenarios you'd use 
+              # network topology information or IPAM data
+              
+              # Get common prefix bits - simplified version
+              if len(networks) <= 10:  # Reasonable number of IPs
+                  # Use a /24 network for multiple IPs by default
+                  first_ip = networks[0]
+                  return f"{first_ip.packed[0]}.{first_ip.packed[1]}.{first_ip.packed[2]}.0/24"
+              else:
+                  # For larger sets, might need a bigger subnet
+                  first_ip = networks[0]
+                  return f"{first_ip.packed[0]}.{first_ip.packed[1]}.0.0/16"
+          except Exception as e:
+              print(f"Error determining subnet: {e}")
+              # Fallback to manual input if specified in incident data
+              return "{incident.manual_subnet}" if "{incident.manual_subnet}" else "unknown"
+      
       # Parse the incident data to determine network segment
       with open("{incident.network_data}", "r") as f:
           data = json.load(f)
@@ -27,29 +103,165 @@ actions:
       # Identify affected subnet based on IP addresses
       subnet = determine_subnet(data["source_ips"])
       
+      # Check for VLAN information
+      vlan_id = data.get("vlan", "unknown")
+      
+      # Get asset criticality from incident data
+      assets = data.get("affected_assets", [])
+      contains_critical = any(asset.get("criticality") == "critical" for asset in assets)
+      
+      # Create output directory if it doesn't exist
+      output_dir = os.path.dirname("{execution.id}_segment.json")
+      if output_dir and not os.path.exists(output_dir):
+          os.makedirs(output_dir)
+      
       # Write to output file for next steps
+      result = {
+          "subnet": subnet, 
+          "vlan": vlan_id,
+          "contains_critical_assets": contains_critical,
+          "asset_count": len(assets),
+          "detected_ips": data["source_ips"]
+      }
+      
       with open("{execution.id}_segment.json", "w") as f:
-          json.dump({"subnet": subnet, "vlan": data.get("vlan")}, f)
+          json.dump(result, f, indent=2)
           
       print(f"Identified network segment: {subnet}")
+      print(f"VLAN ID: {vlan_id}")
+      print(f"Contains critical assets: {contains_critical}")
+      print(f"Number of affected assets: {len(assets)}")
     continue_on_failure: false
     timeout: 120
+    output_variables:
+      - subnet
+      - vlan
+      - contains_critical_assets
+      - asset_count
+
+  - id: pre_isolation_checks
+    type: script
+    description: Perform pre-isolation checks to prevent disruption to critical services
+    script: |
+      #!/bin/python3
+      import json
+      import sys
+      
+      # Load segment data
+      with open("{execution.id}_segment.json", "r") as f:
+          segment_data = json.load(f)
+      
+      # Check for critical network services in segment
+      subnet = segment_data["subnet"]
+      
+      # Simulating check against CMDB for critical services - in production, 
+      # replace with actual API calls to network management or CMDB system
+      critical_services = [
+          {"type": "DNS", "present": False},
+          {"type": "DHCP", "present": False},
+          {"type": "Domain Controller", "present": False},
+          {"type": "Core Router", "present": False}
+      ]
+      
+      # Check for critical assets
+      has_critical_services = segment_data.get("contains_critical_assets", False)
+      
+      # This would be an API call to check services in the subnet
+      # In this example, we're just simulating the result
+      service_check_result = {
+          "safe_to_isolate": True,
+          "warnings": [],
+          "critical_services": critical_services,
+          "isolation_risk": "low" if not has_critical_services else "high"
+      }
+      
+      # Write result for next steps
+      with open("{execution.id}_isolation_check.json", "w") as f:
+          json.dump(service_check_result, f, indent=2)
+          
+      # Print results
+      print(f"Pre-isolation check results for subnet {subnet}:")
+      print(f"Safe to isolate: {service_check_result['safe_to_isolate']}")
+      print(f"Isolation risk: {service_check_result['isolation_risk']}")
+      
+      # Return proper status
+      if not service_check_result['safe_to_isolate']:
+          print("CRITICAL: Unsafe to isolate this network segment automatically!")
+          print("Manual intervention required. Please check isolation_check.json")
+          sys.exit(1)
+      else:
+          print("Network segment is safe to isolate")
+    continue_on_failure: false
+    timeout: 90
+    output_variables:
+      - safe_to_isolate
+      - isolation_risk
+
+  - id: backup_network_configs
+    type: command
+    description: Backup current network device configurations before making changes
+    command: net_control --backup-configs --devices-in-segment {variables.subnet} --output-dir {execution.id}_config_backups
+    continue_on_failure: false
+    timeout: 180
+    parameters:
+      include_acls: true
+      include_routing: true
+      include_vlan: true
 
   - id: block_external_traffic
     type: command
     description: Block all external traffic from the compromised segment
-    command: net_control --segment {action_results.identify_segment.subnet} --block-external --direction both
+    command: net_control --segment {variables.subnet} --block-external --direction both
     continue_on_failure: false
     timeout: 180
     parameters:
       allow_dns: false
       allow_updates: false
       log_connections: true
+      reason: "ASIRA automated response to incident {incident.id}"
+      ticket: "{incident.ticket_id}"
+    output_variable: block_external_result
+
+  - id: verify_external_block
+    type: script
+    description: Verify that external traffic has been successfully blocked
+    script: |
+      #!/bin/bash
+      
+      # Parse the results from the previous step
+      RESULT=$(echo '{variables.block_external_result}' | jq -r '.status')
+      
+      if [ "$RESULT" != "success" ]; then
+        echo "ERROR: Failed to block external traffic. Manual intervention required."
+        echo "Error details: $(echo '{variables.block_external_result}' | jq -r '.error')"
+        exit 1
+      fi
+      
+      # Verify by testing connectivity
+      echo "Verifying external traffic block for subnet {variables.subnet}"
+      BLOCK_TEST=$(net_control --test-connectivity --segment {variables.subnet} --external-targets "8.8.8.8,1.1.1.1")
+      
+      if [ $? -ne 0 ]; then
+        echo "ERROR: Connectivity test failed. Unable to verify isolation."
+        exit 1
+      fi
+      
+      CONNECTIVITY=$(echo $BLOCK_TEST | jq -r '.blocked')
+      
+      if [ "$CONNECTIVITY" == "true" ]; then
+        echo "SUCCESS: External traffic successfully blocked for {variables.subnet}"
+        exit 0
+      else
+        echo "WARNING: External traffic may not be fully blocked. Manual verification needed."
+        exit 1
+      fi
+    continue_on_failure: true
+    timeout: 90
 
   - id: restrict_internal_traffic
     type: command
     description: Restrict internal traffic to essential services only
-    command: net_control --segment {action_results.identify_segment.subnet} --restrict-internal --allow-list critical_services.txt
+    command: net_control --segment {variables.subnet} --restrict-internal --allow-list {execution.id}_essential_services.txt
     continue_on_failure: true
     timeout: 180
     parameters:
@@ -57,59 +269,304 @@ actions:
       allow_authentication: true
       allow_dhcp: true
       allow_dns: true
+      reason: "ASIRA automated response to incident {incident.id}"
+    prepare: |
+      #!/bin/bash
+      # Create list of essential services
+      cat > {execution.id}_essential_services.txt << EOF
+      # Essential services for isolated segment
+      # Generated by ASIRA at $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+      # Incident ID: {incident.id}
+      
+      # Security services
+      10.0.1.0/24:tcp:443  # Security monitoring
+      10.0.1.0/24:tcp:22   # SSH management
+      
+      # Authentication
+      10.0.2.0/24:tcp:389  # LDAP
+      10.0.2.0/24:tcp:636  # LDAPS
+      10.0.2.0/24:tcp:88   # Kerberos
+      
+      # DNS and DHCP
+      10.0.3.0/24:udp:53   # DNS
+      10.0.3.0/24:tcp:53   # DNS
+      10.0.3.0/24:udp:67   # DHCP
+      EOF
 
   - id: enable_enhanced_monitoring
     type: command
     description: Enable enhanced network monitoring for the isolated segment
-    command: net_monitor --segment {action_results.identify_segment.subnet} --level full --pcap true
+    command: net_monitor --segment {variables.subnet} --level full --pcap true
     continue_on_failure: true
     timeout: 120
     parameters:
       retention_hours: 168
       alert_threshold: low
       capture_headers_only: false
+      monitoring_description: "Enhanced monitoring due to security incident {incident.id}"
 
   - id: update_firewall_rules
     type: api_call
     description: Update firewall rules to enforce isolation
     api_endpoint: https://firewall.example.com/api/rules/batch
     api_method: POST
+    api_headers:
+      Authorization: "Bearer {credentials.firewall_api_key}"
+      Content-Type: "application/json"
     api_payload:
       operation: "add"
       priority: "high"
       rules:
-        - name: "ASIRA-ISOLATE-{action_results.identify_segment.subnet}"
-          source: "{action_results.identify_segment.subnet}"
+        - name: "ASIRA-ISOLATE-{variables.subnet}"
+          source: "{variables.subnet}"
           destination: "any"
           service: "any"
           action: "deny"
           log: true
           description: "Automated isolation due to security incident {incident.id}"
+          expiration: "{date.now.plus.48h}"  # 48-hour expiration by default
     continue_on_failure: false
     timeout: 180
+    output_variable: firewall_update_result
+
+  - id: update_network_acls
+    type: api_call
+    description: Update network ACLs on switches and routers
+    api_endpoint: https://netcontrol.example.com/api/acl
+    api_method: POST
+    api_headers:
+      Authorization: "Bearer {credentials.netcontrol_api_key}"
+      Content-Type: "application/json"
+    api_payload:
+      operation: "isolate"
+      segment: "{variables.subnet}"
+      vlan_id: "{variables.vlan}"
+      acl_name: "ASIRA-ISOLATE-{incident.id}"
+      log_level: "high"
+      description: "Automated isolation due to security incident {incident.id}"
+      applied_devices: "auto"
+    continue_on_failure: true
+    timeout: 240
+    output_variable: acl_update_result
 
   - id: scan_segment_hosts
     type: command
     description: Run security scans on all hosts in the isolated segment
-    command: net_control --segment {action_results.identify_segment.subnet} --scan-hosts --vulnerability-scan --malware-scan
+    command: net_control --segment {variables.subnet} --scan-hosts --vulnerability-scan --malware-scan
     continue_on_failure: true
     timeout: 1800  # 30 minutes
     parameters:
       parallel: true
       max_concurrent: 10
       priority: high
+      scan_profile: "incident_response"
+      output_format: "json"
+      output_file: "{execution.id}_scan_results.json"
+    output_variable: scan_results_path
+
+  - id: analyze_scan_results
+    type: script
+    description: Analyze scan results for IOCs and recommend actions
+    script: |
+      #!/bin/python3
+      import json
+      import sys
+      
+      # Load scan results
+      try:
+          with open("{variables.scan_results_path}", "r") as f:
+              scan_data = json.load(f)
+      except (FileNotFoundError, json.JSONDecodeError) as e:
+          print(f"Error reading scan results: {e}")
+          sys.exit(1)
+      
+      # Process scan findings
+      hosts_scanned = scan_data.get("hosts_scanned", 0)
+      hosts_infected = len([h for h in scan_data.get("hosts", []) if h.get("malware_detected", False)])
+      vuln_critical = sum(1 for h in scan_data.get("hosts", []) 
+                         for v in h.get("vulnerabilities", []) 
+                         if v.get("severity") == "critical")
+      vuln_high = sum(1 for h in scan_data.get("hosts", []) 
+                     for v in h.get("vulnerabilities", []) 
+                     if v.get("severity") == "high")
+      
+      # Generate action items
+      action_items = []
+      if hosts_infected > 0:
+          action_items.append(f"Quarantine {hosts_infected} infected hosts")
+          action_items.append("Collect forensic evidence from infected hosts")
+      
+      if vuln_critical > 0:
+          action_items.append(f"Address {vuln_critical} critical vulnerabilities")
+      
+      if vuln_high > 0:
+          action_items.append(f"Plan remediation for {vuln_high} high-severity vulnerabilities")
+      
+      # Generate summary report
+      summary = {
+          "hosts_scanned": hosts_scanned,
+          "hosts_infected": hosts_infected,
+          "vulnerabilities": {
+              "critical": vuln_critical,
+              "high": vuln_high
+          },
+          "action_items": action_items,
+          "results_url": f"https://asira.example.com/incidents/{incident.id}/scans/{execution.id}"
+      }
+      
+      # Save summary
+      with open("{execution.id}_scan_summary.json", "w") as f:
+          json.dump(summary, f, indent=2)
+      
+      # Print summary
+      print(f"Scan complete: {hosts_scanned} hosts scanned")
+      print(f"Infected hosts: {hosts_infected}")
+      print(f"Critical vulnerabilities: {vuln_critical}")
+      print(f"High-severity vulnerabilities: {vuln_high}")
+      print("\nRecommended action items:")
+      for item in action_items:
+          print(f"- {item}")
+    continue_on_failure: true
+    timeout: 180
+    output_variables:
+      - hosts_scanned
+      - hosts_infected
+      - results_url
+      - action_items
 
   - id: create_access_exceptions
     type: command
     description: Create temporary access exceptions for essential personnel
     script: |
       #!/bin/bash
-      # Read list of essential personnel from incident data
-      cat {incident.essential_personnel} | while read user; do
-        net_control --exception --user $user --segment {action_results.identify_segment.subnet} --duration 24h
+      # Set up logging
+      LOGFILE="{execution.id}_exceptions.log"
+      echo "Creating access exceptions - $(date -u)" > $LOGFILE
+      
+      # Ensure essential personnel file exists
+      if [ ! -f "{incident.essential_personnel}" ]; then
+        echo "ERROR: Essential personnel file not found: {incident.essential_personnel}" | tee -a $LOGFILE
+        exit 1
+      fi
+      
+      # Create exceptions - one per line in format "username,reason"
+      EXCEPTION_COUNT=0
+      EXCEPTION_FAILED=0
+      
+      cat {incident.essential_personnel} | while IFS=, read -r user reason; do
+        # Skip comment lines and empty lines
+        [[ "$user" =~ ^#.*$ || -z "$user" ]] && continue
+        
+        echo "Creating exception for user: $user - $reason" | tee -a $LOGFILE
+        
+        # Execute the command to create the exception
+        RESULT=$(net_control --exception --user "$user" --segment {variables.subnet} \
+                --duration 24h --reason "$reason" --incident-id "{incident.id}" 2>&1)
+        
+        if [ $? -eq 0 ]; then
+          echo "SUCCESS: Exception created for $user" | tee -a $LOGFILE
+          EXCEPTION_COUNT=$((EXCEPTION_COUNT+1))
+        else
+          echo "FAILED: Exception creation failed for $user: $RESULT" | tee -a $LOGFILE
+          EXCEPTION_FAILED=$((EXCEPTION_FAILED+1))
+        fi
       done
+      
+      # Summary
+      echo "Exception creation complete. Created $EXCEPTION_COUNT exceptions. Failed: $EXCEPTION_FAILED" | tee -a $LOGFILE
+      echo "::set-output exception_count=$EXCEPTION_COUNT"
+      echo "::set-output exception_failed=$EXCEPTION_FAILED"
     continue_on_failure: true
     timeout: 120
+    output_variables:
+      - exception_count
+      - exception_failed
+
+  - id: create_isolation_report
+    type: script
+    description: Create a detailed isolation report for documentation
+    script: |
+      #!/bin/python3
+      import json
+      import datetime
+      
+      # Load data from previous steps
+      try:
+          with open("{execution.id}_segment.json", "r") as f:
+              segment_data = json.load(f)
+              
+          with open("{execution.id}_scan_summary.json", "r") as f:
+              scan_data = json.load(f)
+      except Exception as e:
+          print(f"Warning: Could not load all result data: {e}")
+      
+      # Create isolation report
+      report = {
+          "incident_id": "{incident.id}",
+          "execution_id": "{execution.id}",
+          "isolation_time": datetime.datetime.utcnow().isoformat(),
+          "network_segment": segment_data.get("subnet"),
+          "vlan_id": segment_data.get("vlan"),
+          "block_status": "Successful",
+          "scan_results": {
+              "hosts_scanned": scan_data.get("hosts_scanned", 0),
+              "hosts_infected": scan_data.get("hosts_infected", 0),
+              "critical_vulnerabilities": scan_data.get("vulnerabilities", {}).get("critical", 0),
+              "high_vulnerabilities": scan_data.get("vulnerabilities", {}).get("high", 0)
+          },
+          "action_items": scan_data.get("action_items", []),
+          "exceptions_created": "{variables.exception_count}",
+          "results_url": scan_data.get("results_url", ""),
+          "restoration_procedure": "https://asira.example.com/playbooks/network_restoration"
+      }
+      
+      # Save report
+      with open("{execution.id}_isolation_report.json", "w") as f:
+          json.dump(report, f, indent=2)
+          
+      # Create HTML version for email
+      html_report = f"""
+      <html>
+      <body>
+        <h2>Network Isolation Report</h2>
+        <p><strong>Incident ID:</strong> {report["incident_id"]}</p>
+        <p><strong>Isolation Time:</strong> {report["isolation_time"]}</p>
+        <p><strong>Network Segment:</strong> {report["network_segment"]}</p>
+        <p><strong>VLAN ID:</strong> {report["vlan_id"]}</p>
+        
+        <h3>Scan Results</h3>
+        <ul>
+          <li>Hosts Scanned: {report["scan_results"]["hosts_scanned"]}</li>
+          <li>Hosts Infected: {report["scan_results"]["hosts_infected"]}</li>
+          <li>Critical Vulnerabilities: {report["scan_results"]["critical_vulnerabilities"]}</li>
+          <li>High Vulnerabilities: {report["scan_results"]["high_vulnerabilities"]}</li>
+        </ul>
+        
+        <h3>Recommended Actions</h3>
+        <ol>
+      """
+      
+      for item in report["action_items"]:
+          html_report += f"<li>{item}</li>\n"
+          
+      html_report += f"""
+        </ol>
+        
+        <p><strong>Exceptions Created:</strong> {report["exceptions_created"]}</p>
+        <p><strong>Results URL:</strong> <a href="{report["results_url"]}">{report["results_url"]}</a></p>
+        <p><strong>Restoration Procedure:</strong> <a href="{report["restoration_procedure"]}">{report["restoration_procedure"]}</a></p>
+      </body>
+      </html>
+      """
+      
+      with open("{execution.id}_isolation_report.html", "w") as f:
+          f.write(html_report)
+      
+      print(f"Isolation report created: {execution.id}_isolation_report.json")
+      print(f"HTML report created: {execution.id}_isolation_report.html")
+    continue_on_failure: true
+    timeout: 60
+    output_variable: report_path
 
   - id: notify_network_team
     type: notification
@@ -120,12 +577,16 @@ actions:
       - slack
       - pagerduty
     parameters:
-      segment: "{action_results.identify_segment.subnet}"
-      vlan: "{action_results.identify_segment.vlan}"
+      segment: "{variables.subnet}"
+      vlan: "{variables.vlan}"
       incident_id: "{incident.id}"
       duration: "Indefinite - manual restoration required"
       approver: "{incident.created_by}"
-      scan_results: "{action_results.scan_segment_hosts.results_url}"
+      scan_results: "{variables.results_url}"
+      report_file: "{variables.report_path}"
+      hosts_infected: "{variables.hosts_infected}"
+      hosts_scanned: "{variables.hosts_scanned}"
+      action_items: "{variables.action_items}"
     continue_on_failure: true
     timeout: 60
 
@@ -137,12 +598,43 @@ actions:
       - email
       - sms
     parameters:
-      segment_name: "Network segment {action_results.identify_segment.subnet}"
+      segment_name: "Network segment {variables.subnet}"
       restrictions: "Limited network access due to security incident"
       estimated_duration: "TBD - security investigation in progress"
       support_contact: "it-security@example.com"
+      incident_reference: "{incident.id}"
     continue_on_failure: true
     timeout: 180
+    condition: "{incident.notify_users == true}"
+
+  - id: create_incident_ticket
+    type: api_call
+    description: Create a ticket in the IT service management system
+    api_endpoint: https://itsm.example.com/api/tickets
+    api_method: POST
+    api_headers:
+      Authorization: "Bearer {credentials.itsm_api_key}"
+      Content-Type: "application/json"
+    api_payload:
+      title: "Network Segment Isolation - {variables.subnet}"
+      description: |
+        Security incident {incident.id} triggered isolation of network segment {variables.subnet}.
+        
+        * Hosts scanned: {variables.hosts_scanned}
+        * Hosts infected: {variables.hosts_infected}
+        
+        Please refer to the isolation report for complete details and restoration procedures.
+      priority: "{incident.severity}"
+      category: "Security"
+      subcategory: "Network Isolation"
+      assigned_team: "Network Security"
+      metadata:
+        incident_id: "{incident.id}"
+        segment: "{variables.subnet}"
+        vlan: "{variables.vlan}"
+    continue_on_failure: true
+    timeout: 60
+    output_variable: ticket_id
 
 tags:
   - network
@@ -154,3 +646,62 @@ tags:
 target_severity:
   - high
   - critical
+
+required_parameters:
+  - network_data
+  - severity
+  - id
+  - created_by
+
+cleanup_actions:
+  - id: archive_isolation_data
+    type: command
+    description: Archive isolation data for future reference
+    command: |
+      #!/bin/bash
+      
+      # Create archive directory
+      ARCHIVE_DIR="/var/log/asira/incidents/{incident.id}/network_isolation"
+      mkdir -p "$ARCHIVE_DIR"
+      
+      # Copy all data files to archive
+      cp {execution.id}_*.json "$ARCHIVE_DIR/"
+      cp {execution.id}_*.html "$ARCHIVE_DIR/"
+      cp {execution.id}_*.log "$ARCHIVE_DIR/" 2>/dev/null || true
+      
+      # Create archive note
+      cat > "$ARCHIVE_DIR/README.txt" << EOF
+      Network Isolation Data for Incident {incident.id}
+      ================================================
+      Isolation executed: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+      Executed by: {incident.created_by}
+      Network segment: {variables.subnet}
+      VLAN: {variables.vlan}
+      
+      This directory contains archived data from the network isolation
+      playbook execution. To restore network connectivity, use the
+      network_restoration playbook.
+      EOF
+      
+      echo "Isolation data archived to $ARCHIVE_DIR"
+    timeout: 60
+
+  - id: set_restoration_reminder
+    type: api_call
+    description: Set a reminder to review isolation after 24 hours
+    api_endpoint: https://itsm.example.com/api/reminders
+    api_method: POST
+    api_headers:
+      Authorization: "Bearer {credentials.itsm_api_key}"
+      Content-Type: "application/json"
+    api_payload:
+      title: "Review Network Isolation - Incident {incident.id}"
+      description: |
+        This is an automated reminder to review the network isolation for segment {variables.subnet}.
+        The isolation has been in place for 24 hours. Please review the incident and determine
+        if the isolation can be lifted or should be extended.
+      due_date: "{date.now.plus.24h}"
+      assigned_to: "{incident.created_by}"
+      priority: "high"
+      related_ticket: "{variables.ticket_id}"
+    timeout: 30
