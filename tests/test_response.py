@@ -1600,6 +1600,5 @@ def test_variable_passing_between_actions(self):
     # Test that variables would have been passed correctly
     # This is a bit hard to fully test without executing real commands,
     # but we've mocked the behavior above
-
-if name == "main": unittest.main()
-
+if __name__ == "__main__":
+    unittest.main()
