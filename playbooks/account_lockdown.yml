@@ -1,7 +1,7 @@
 # ASIRA Account Lockdown Playbook
 # Version: 1.0.0
-# Last updated: 2025-03-15 12:34:22
-# Author: Mritunjay-mj
+# Last updated: 2025-03-16 13:09:38
+# Author: Rahul
 
 id: pb_account_lockdown
 name: Account Lockdown
@@ -9,8 +9,8 @@ description: Locks down a potentially compromised user account and performs secu
 execution_mode: sequential
 enabled: true
 version: 1.0.0
-created_at: 1741784062
-updated_at: 1741784062
+created_at: 1741784578
+updated_at: 1741784578
 author: Mritunjay-mj
 
 actions:
@@ -59,6 +59,41 @@ actions:
     command: user_mgmt audit {incident.username} --days 30 --format json > {execution.id}_login_history.json
     continue_on_failure: true
     timeout: 120
+    output_variable: login_history_path
+
+  - id: analyze_login_patterns
+    type: script
+    description: Analyze login patterns for suspicious activity
+    script: |
+      #!/bin/bash
+      echo "Analyzing login history for user {incident.username}"
+      
+      # Parse the login history file
+      LOGIN_FILE="{variables.login_history_path}"
+      if [ -f "$LOGIN_FILE" ]; then
+        # Find unusual login locations
+        unusual_locations=$(jq '.logins[] | select(.is_unusual_location == true) | .ip_address' "$LOGIN_FILE")
+        unusual_count=$(echo "$unusual_locations" | wc -l)
+        
+        # Find failed login attempts
+        failed_attempts=$(jq '.logins[] | select(.status == "failed")' "$LOGIN_FILE" | wc -l)
+        
+        # Output results
+        echo "Found $unusual_count unusual login locations"
+        echo "Found $failed_attempts failed login attempts"
+        
+        # Set variables for later actions
+        echo "::set-output unusual_locations=$unusual_count"
+        echo "::set-output failed_attempts=$failed_attempts"
+      else
+        echo "Login history file not found: $LOGIN_FILE"
+        exit 1
+      fi
+    continue_on_failure: true
+    timeout: 60
+    output_variables:
+      - unusual_locations
+      - failed_attempts
 
   - id: notify_security_team
     type: notification
@@ -72,6 +107,8 @@ actions:
       username: "{incident.username}"
       incident_id: "{incident.id}"
       incident_url: "https://asira.example.com/incidents/{incident.id}"
+      unusual_locations: "{variables.unusual_locations}"
+      failed_attempts: "{variables.failed_attempts}"
     continue_on_failure: true
     timeout: 30
 
@@ -89,6 +126,30 @@ actions:
     continue_on_failure: true
     timeout: 30
 
+  - id: create_incident_ticket
+    type: api_call
+    description: Create a ticket in the IT service management system
+    api_endpoint: https://itsm.example.com/api/tickets
+    api_method: POST
+    api_headers:
+      Authorization: "Bearer {credentials.itsm_api_key}"
+      Content-Type: "application/json"
+    api_payload:
+      title: "Account Security Incident - {incident.username}"
+      description: "Security incident {incident.id} triggered account lockdown for user {incident.username}"
+      priority: "{incident.severity}"
+      category: "Security"
+      subcategory: "Account Compromise"
+      assigned_team: "Security Operations"
+      metadata:
+        incident_id: "{incident.id}"
+        unusual_locations: "{variables.unusual_locations}"
+        failed_attempts: "{variables.failed_attempts}"
+    condition: "{incident.severity == 'high' or incident.severity == 'critical'}"
+    continue_on_failure: true
+    timeout: 60
+    output_variable: ticket_id
+
 tags:
   - account
   - identity
@@ -99,3 +160,22 @@ target_severity:
   - medium
   - high
   - critical
+
+required_parameters:
+  - username
+  - severity
+  - id
+
+cleanup_actions:
+  - id: archive_log_history
+    type: command
+    description: Archive the login history for future reference
+    command: |
+      if [ -f "{variables.login_history_path}" ]; then
+        mkdir -p /var/log/asira/incidents/{incident.id}
+        cp {variables.login_history_path} /var/log/asira/incidents/{incident.id}/login_history.json
+        echo "Login history archived to /var/log/asira/incidents/{incident.id}/login_history.json"
+      else
+        echo "No login history to archive"
+      fi
+    timeout: 30
