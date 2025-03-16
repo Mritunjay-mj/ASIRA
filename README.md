@@ -77,12 +77,37 @@ chmod +x install.sh
 
 # Run the installation script with root privileges
 sudo ./install.sh
+```
 
+### Running the Application
 
+#### Using Docker Compose
 
+To run the application using Docker Compose, follow these steps:
 
-Development
-Directory Structure
+1. Ensure Docker and Docker Compose are installed on your system.
+2. Navigate to the project directory.
+3. Run the following command to start the services:
+
+```bash
+docker-compose up
+```
+
+This will start the `api`, `postgres`, `elasticsearch`, `redis`, `rabbitmq`, and `dashboard` services.
+
+#### Using Uvicorn
+
+To run the application using `uvicorn`, use the following command:
+
+```bash
+uvicorn src.main:app --host 0.0.0.0 --port 8000
+```
+
+### Development
+
+#### Directory Structure
+
+```
 ├── src/                   # Source code
 │   ├── api/               # API module
 │   ├── detection/         # Detection engine
@@ -96,10 +121,9 @@ Directory Structure
 └── requirements.txt       # Python dependencies
 ```
 
+#### Running Tests
 
 ```bash
-
-Running Tests
 # Run all tests
 python -m pytest
 
@@ -110,26 +134,30 @@ python -m pytest --cov=src tests/
 python -m pytest tests/test_detection.py
 ```
 
-API Documentation
-For comprehensive API documentation, see API Documentation.
+### API Documentation
 
-Contributing
+For comprehensive API documentation, see [API Documentation](docs/api.md).
+
+### Contributing
+
 We welcome contributions to ASIRA! Please follow these guidelines:
 
-Fork the repository
-Create a feature branch
-Add your changes
-Run tests to ensure functionality
-Submit a pull request
-For more details, see our Contributing Guidelines.
+1. Fork the repository
+2. Create a feature branch
+3. Add your changes
+4. Run tests to ensure functionality
+5. Submit a pull request
 
-Security
-If you discover a security vulnerability in ASIRA, please send an email to iamrahul823@gmail.com. All security vulnerabilities will be promptly addressed.
+For more details, see our [Contributing Guidelines](CONTRIBUTING.md).
 
+### Security
 
-Acknowledgments
-Thanks to all contributors who have helped build ASIRA
-Special thanks to the open-source projects that made this possible
-Inspired by real-world security incident response challenges
-For additional support, please open an issue on GitHub or contact support@example.com.
+If you discover a security vulnerability in ASIRA, please send an email to [iamrahul823@gmail.com](mailto:iamrahul823@gmail.com). All security vulnerabilities will be promptly addressed.
 
+### Acknowledgments
+
+- Thanks to all contributors who have helped build ASIRA
+- Special thanks to the open-source projects that made this possible
+- Inspired by real-world security incident response challenges
+
+For additional support, please open an issue on GitHub or contact [support@example.com](mailto:support@example.com).
